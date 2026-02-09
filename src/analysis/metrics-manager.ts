@@ -156,11 +156,16 @@ export class MetricsManager {
   }
 
   private async calculateCBO(classId: string): Promise<number> {
+    // CBO counts the number of other classes this class is coupled to
+    // This includes: inheritance, interface implementation, field types, method parameters, etc.
     const query = `
       MATCH (class:CodeNode {id: $classId})
-      OPTIONAL MATCH (class)-[:CALLS|REFERENCES]-(other:CodeNode {type: 'class'})
-      WHERE other.id <> $classId
-      RETURN count(DISTINCT other) as cbo
+      OPTIONAL MATCH (class)-[:EXTENDS|IMPLEMENTS|REFERENCES]->(other:CodeNode)
+      WHERE other.type IN ['class', 'interface'] AND other.id <> $classId
+      WITH class, collect(DISTINCT other) as outgoing
+      OPTIONAL MATCH (class)<-[:EXTENDS|IMPLEMENTS|REFERENCES]-(incoming:CodeNode)
+      WHERE incoming.type IN ['class', 'interface'] AND incoming.id <> $classId
+      RETURN size(outgoing) + size(collect(DISTINCT incoming)) as cbo
     `;
     const result = await this.client.runQuery(query, { classId });
     return result.records[0]?.get('cbo').toNumber() || 0;
@@ -234,18 +239,19 @@ export class MetricsManager {
 
   // Architectural Analysis
   private async findCircularDependencies(): Promise<ArchitecturalIssue[]> {
+    // Use REFERENCES relationship to detect circular dependencies between classes
     const query = `
-      MATCH (p1:CodeNode {type: 'package'})-[:DEPENDS_ON*2..5]->(p2:CodeNode {type: 'package'})
-      WHERE p1 = p2
-      RETURN DISTINCT p1.name as packageName
+      MATCH (c1:CodeNode {type: 'class'})-[:REFERENCES*2..5]->(c2:CodeNode {type: 'class'})
+      WHERE c1 = c2
+      RETURN DISTINCT c1.name as className
     `;
     const result = await this.client.runQuery(query);
     
     return result.records.map(record => ({
       type: 'circular_dependency' as const,
       severity: 'high' as const,
-      description: `Circular dependency detected in package: ${record.get('packageName')}`,
-      entities: [record.get('packageName')]
+      description: `Circular dependency detected involving class: ${record.get('className')}`,
+      entities: [record.get('className')]
     }));
   }
 

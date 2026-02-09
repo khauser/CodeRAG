@@ -97,5 +97,58 @@ public class TestClass {
       expect(result).toHaveProperty('relationships');
       expect(result).toHaveProperty('errors');
     });
+
+    test('should create REFERENCES relationships for generic type arguments', async () => {
+      const javaCode = `
+        package com.test;
+        
+        import java.util.Collection;
+        
+        public class ItemRO {
+          private Collection<FormatterRO> formatters;
+          private String name;
+        }
+      `;
+
+      const result = await parser.parseFile(filePath, javaCode, projectId);
+
+      // Find REFERENCES relationships (lowercase in the result)
+      const referencesRelationships = result.relationships.filter(r => r.type === 'references');
+      
+      // Should have a reference to FormatterRO from both the field and the class
+      const formatterReferences = referencesRelationships.filter(r => 
+        r.target.includes('FormatterRO')
+      );
+      
+      expect(formatterReferences.length).toBeGreaterThanOrEqual(1);
+      
+      // Verify the reference target is resolved to the correct package
+      expect(formatterReferences.some(r => r.target === 'com.test.FormatterRO')).toBe(true);
+    });
+
+    test('should create REFERENCES for nested generic types', async () => {
+      const javaCode = `
+        package com.example;
+        
+        import java.util.Map;
+        import java.util.List;
+        
+        public class ComplexClass {
+          private Map<KeyType, List<ValueType>> complexMap;
+        }
+      `;
+
+      const result = await parser.parseFile(filePath, javaCode, projectId);
+
+      // Find REFERENCES relationships (lowercase in the result)
+      const referencesRelationships = result.relationships.filter(r => r.type === 'references');
+      
+      // Should have references to both KeyType and ValueType
+      const keyTypeRefs = referencesRelationships.filter(r => r.target.includes('KeyType'));
+      const valueTypeRefs = referencesRelationships.filter(r => r.target.includes('ValueType'));
+      
+      expect(keyTypeRefs.length).toBeGreaterThanOrEqual(1);
+      expect(valueTypeRefs.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

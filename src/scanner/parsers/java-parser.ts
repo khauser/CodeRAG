@@ -67,17 +67,10 @@ export class JavaParser extends BaseLanguageParser {
         createdPackagesForProject.add(packageId);
       }
 
-      // Create module entity
-      const moduleId = `${packageName}.${path.basename(filePath, '.java')}`;
-      const moduleEntity = EntityFactory.createModule(
-        moduleId,
-        path.basename(filePath, '.java'),
-        moduleId,
-        filePath,
-        `Java file: ${path.basename(filePath)}`
-      );
-      this.addEntity(entities, moduleEntity);
-      this.addRelationship(relationships, RelationshipBuilder.createBelongsTo(moduleId, packageId, filePath));
+      // NOTE: We do NOT create a separate "module" entity for Java files.
+      // In Java, the primary compilation unit is the class/interface/enum, not the file.
+      // Creating a module with the same ID as the class would cause the class to be
+      // overwritten during deduplication, resulting in classes being stored as "module" type.
 
       // Parse different entity types using specialized parsers
       this.classParser.parseClasses(
@@ -138,12 +131,16 @@ export class JavaParser extends BaseLanguageParser {
 
       this.addEntity(entities, interfaceEntity);
       this.addRelationship(relationships, RelationshipBuilder.createBelongsTo(interfaceId, packageName, filePath));
+      this.addRelationship(relationships, RelationshipBuilder.createContains(packageName, interfaceId, filePath));
 
       // Handle interface inheritance
       if (parsedInterface.extends && parsedInterface.extends.length > 0) {
         for (const parentInterface of parsedInterface.extends) {
           const parentId = this.resolveType(parentInterface.trim(), packageName, extractionResult.imports);
-          this.addRelationship(relationships, RelationshipBuilder.createExtends(interfaceId, parentId, filePath));
+          // Skip relationships to standard library types
+          if (!this.isStandardLibraryType(parentId)) {
+            this.addRelationship(relationships, RelationshipBuilder.createExtends(interfaceId, parentId, filePath));
+          }
         }
       }
     }
@@ -174,6 +171,7 @@ export class JavaParser extends BaseLanguageParser {
 
       this.addEntity(entities, enumEntity);
       this.addRelationship(relationships, RelationshipBuilder.createBelongsTo(enumId, packageName, filePath));
+      this.addRelationship(relationships, RelationshipBuilder.createContains(packageName, enumId, filePath));
     }
   }
 
@@ -195,6 +193,49 @@ export class JavaParser extends BaseLanguageParser {
     
     // Default to same package
     return `${packageName}.${baseType}`;
+  }
+
+  private isStandardLibraryType(typeName: string): boolean {
+    // Standard Java library packages
+    const javaStandardPackages = [
+      'java.lang.',
+      'java.util.',
+      'java.io.',
+      'java.math.',
+      'java.time.',
+      'java.net.',
+      'java.nio.',
+      'java.sql.',
+      'java.text.',
+      'java.security.',
+      'java.util.concurrent.',
+      'java.util.function.',
+      'java.util.stream.',
+      'java.util.regex.',
+      'javax.',
+      'jakarta.',
+      'org.w3c.',
+      'org.xml.',
+      'sun.',
+      'com.sun.'
+    ];
+    
+    for (const pkg of javaStandardPackages) {
+      if (typeName.startsWith(pkg)) {
+        return true;
+      }
+    }
+    
+    // Common standard library types (unqualified names that might be resolved)
+    const baseTypeName = typeName.split('.').pop() || typeName;
+    const commonStdTypes = [
+      'Serializable', 'Cloneable', 'Comparable', 'Iterable', 'AutoCloseable',
+      'Runnable', 'Callable', 'Future', 'Closeable', 'Flushable',
+      'Exception', 'RuntimeException', 'Error', 'Throwable',
+      'Object', 'Class', 'String', 'Number', 'Enum'
+    ];
+    
+    return commonStdTypes.includes(baseTypeName);
   }
 
   private getPackageFromPath(filePath: string): string {

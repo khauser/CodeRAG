@@ -88,7 +88,7 @@ export class JavaContentExtractor extends BaseContentExtractor {
       }
 
       if (implementsClause) {
-        parsedClass.implements = implementsClause.split(',').map(i => i.trim());
+        parsedClass.implements = this.splitTypeList(implementsClause);
       }
 
       classes.push(parsedClass);
@@ -114,7 +114,7 @@ export class JavaContentExtractor extends BaseContentExtractor {
       };
 
       if (extendsClause) {
-        parsedInterface.extends = extendsClause.split(',').map(i => i.trim());
+        parsedInterface.extends = this.splitTypeList(extendsClause);
       }
 
       interfaces.push(parsedInterface);
@@ -227,5 +227,42 @@ export class JavaContentExtractor extends BaseContentExtractor {
     }
     
     return 'default';
+  }
+
+  /**
+   * Split a comma-separated list of types while respecting generic type brackets.
+   * For example: "Interface1, Interface2<A, B>, Interface3" should split into
+   * ["Interface1", "Interface2<A, B>", "Interface3"]
+   */
+  private splitTypeList(typeList: string): string[] {
+    const result: string[] = [];
+    let current = '';
+    let depth = 0;
+
+    for (const char of typeList) {
+      if (char === '<') {
+        depth++;
+        current += char;
+      } else if (char === '>') {
+        depth--;
+        current += char;
+      } else if (char === ',' && depth === 0) {
+        const trimmed = current.trim();
+        if (trimmed) {
+          result.push(trimmed);
+        }
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+
+    // Add the last item
+    const trimmed = current.trim();
+    if (trimmed) {
+      result.push(trimmed);
+    }
+
+    return result;
   }
 }

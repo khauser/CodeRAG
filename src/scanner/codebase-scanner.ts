@@ -341,11 +341,13 @@ export class CodebaseScanner {
       patterns.push('**/*.js', '**/*.jsx');
     }
     if (languages.includes('java')) {
-      // For Java, only include files from standard Maven/Gradle directory structure
-      patterns.push('src/main/**/*.java');
-      if (includeTests) {
-        patterns.push('src/test/**/*.java');
-      }
+      // For Java, include ALL .java files to support various project structures:
+      // - Standard Maven/Gradle: src/main/java, src/test/java
+      // - Legacy projects: src/**/*.java
+      // - Multi-module projects: modules/*/src/**/*.java
+      // - Non-standard structures: any .java file
+      patterns.push('**/*.java');
+      // Note: Test files are excluded by excludePatterns if includeTests is false
     }
     if (languages.includes('python')) {
       patterns.push('**/*.py');
@@ -423,7 +425,8 @@ export class CodebaseScanner {
     }, {} as Record<string, number>);
     console.log(`📋 Entity types:`, entityTypeCounts);
     
-    // Store entities in batches
+    // Store entities in batches and track successfully stored ones
+    const successfullyStoredEntities: ParsedEntity[] = [];
     const entityBatchSize = 100;
     for (let i = 0; i < deduplicatedEntities.length; i += entityBatchSize) {
       const batch = deduplicatedEntities.slice(i, i + entityBatchSize);
@@ -442,6 +445,7 @@ export class CodebaseScanner {
             modifiers: entity.modifiers,
             attributes: entity.attributes
           });
+          successfullyStoredEntities.push(entity);
         } catch (error) {
           // Skip duplicates or other node creation errors
           if (!(error instanceof Error) || !error.message.includes('already exists')) {
@@ -452,6 +456,9 @@ export class CodebaseScanner {
               message: error instanceof Error ? error.message : String(error),
               severity: 'error'
             });
+          } else {
+            // Entity already exists, still consider it for embeddings
+            successfullyStoredEntities.push(entity);
           }
         }
       }));
@@ -459,51 +466,73 @@ export class CodebaseScanner {
 
     console.log(`🔗 Storing relationships...`);
     
-    // Debug: Check if relationship targets exist in entities
-    const entityIds = new Set(deduplicatedEntities.map(e => e.id));
-    const missingTargets = relationships.filter(r => !entityIds.has(r.source) || !entityIds.has(r.target));
-    console.log(`📋 Missing relationship targets: ${missingTargets.length} out of ${relationships.length}`);
+    // Deduplicate relationships by ID + project_id
+    const relationshipMap = new Map<string, ParsedRelationship>();
+    for (const relationship of relationships) {
+      const key = `${relationship.project_id}:${relationship.id}`;
+      if (!relationshipMap.has(key)) {
+        relationshipMap.set(key, relationship);
+      }
+    }
+    const deduplicatedRelationships = Array.from(relationshipMap.values());
     
-    if (missingTargets.length > 0) {
-      console.log(`📋 Sample missing targets:`, missingTargets.slice(0, 3).map(r => `${r.source} -> ${r.target} (source exists: ${entityIds.has(r.source)}, target exists: ${entityIds.has(r.target)})`));
+    // Check if relationship targets exist in entities
+    const entityIds = new Set(deduplicatedEntities.map(e => e.id));
+    
+    // Filter out relationships where source or target doesn't exist
+    const storableRelationships = deduplicatedRelationships.filter(r => 
+      entityIds.has(r.source) && entityIds.has(r.target)
+    );
+    
+    // Count skipped relationships by type for informational logging
+    const skippedByType: Record<string, number> = {};
+    for (const r of deduplicatedRelationships) {
+      if (!entityIds.has(r.source) || !entityIds.has(r.target)) {
+        skippedByType[r.type] = (skippedByType[r.type] || 0) + 1;
+      }
     }
     
-    // Store relationships in batches
-    const relationshipBatchSize = 100;
-    for (let i = 0; i < relationships.length; i += relationshipBatchSize) {
-      const batch = relationships.slice(i, i + relationshipBatchSize);
-      await Promise.all(batch.map(async (relationship) => {
-        try {
-          await this.edgeManager.addEdge({
-            id: relationship.id,
-            project_id: relationship.project_id,
-            type: relationship.type as any,
+    const totalSkipped = deduplicatedRelationships.length - storableRelationships.length;
+    if (totalSkipped > 0) {
+      console.log(`📋 Skipping ${totalSkipped} relationships with external/missing targets:`);
+      for (const [type, count] of Object.entries(skippedByType).sort((a, b) => b[1] - a[1])) {
+        console.log(`   - ${type}: ${count}`);
+      }
+    }
+    
+    console.log(`📋 Storing ${storableRelationships.length} relationships`);
+    
+    // Store relationships sequentially to avoid Neo4j deadlocks
+    // Neo4j can deadlock when parallel transactions try to lock the same nodes/relationships
+    let storedCount = 0;
+    for (const relationship of storableRelationships) {
+      try {
+        await this.storeRelationshipWithRetry(relationship, 3);
+        storedCount++;
+        if (storedCount % 1000 === 0) {
+          console.log(`📊 Stored ${storedCount}/${storableRelationships.length} relationships`);
+        }
+      } catch (error) {
+        // Skip duplicates or other relationship creation errors
+        if (!(error instanceof Error) || !error.message.includes('already exists')) {
+          console.warn(`Failed to store relationship ${relationship.id}: ${error instanceof Error ? error.message : String(error)}`);
+          errors.push({
+            type: 'edge_creation_error',
+            relationship_id: relationship.id,
             source: relationship.source,
             target: relationship.target,
-            attributes: relationship.attributes
+            message: error instanceof Error ? error.message : String(error),
+            severity: 'error'
           });
-        } catch (error) {
-          // Skip duplicates or other relationship creation errors
-          if (!(error instanceof Error) || !error.message.includes('already exists')) {
-            console.warn(`Failed to store relationship ${relationship.id}: ${error instanceof Error ? error.message : String(error)}`);
-            errors.push({
-              type: 'edge_creation_error',
-              relationship_id: relationship.id,
-              source: relationship.source,
-              target: relationship.target,
-              message: error instanceof Error ? error.message : String(error),
-              severity: 'error'
-            });
-          }
         }
-      }));
+      }
     }
 
     // Generate embeddings if semantic search is enabled
     if (this.embeddingService.isEnabled()) {
-      console.log(`🧠 Generating semantic embeddings for ${deduplicatedEntities.length} entities...`);
+      console.log(`🧠 Generating semantic embeddings for ${successfullyStoredEntities.length} entities...`);
       try {
-        const embeddingResult = await this.generateEmbeddingsForEntities(deduplicatedEntities);
+        const embeddingResult = await this.generateEmbeddingsForEntities(successfullyStoredEntities);
         console.log(`✅ Generated embeddings for ${embeddingResult.successful} entities (${embeddingResult.failed} failed)`);
         
         if (embeddingResult.failed > 0) {
@@ -665,6 +694,50 @@ ${errors.length > 10 ? `  ... and ${errors.length - 10} more` : ''}
     };
     
     return this.scanProject(remoteConfig);
+  }
+
+  /**
+   * Store a relationship with retry logic for handling Neo4j deadlocks
+   */
+  private async storeRelationshipWithRetry(
+    relationship: ParsedRelationship, 
+    maxRetries: number
+  ): Promise<void> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await this.edgeManager.addEdge({
+          id: relationship.id,
+          project_id: relationship.project_id,
+          type: relationship.type as any,
+          source: relationship.source,
+          target: relationship.target,
+          attributes: relationship.attributes
+        });
+        return; // Success
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Check if it's a deadlock/lock error that's worth retrying
+        const isDeadlock = lastError.message.includes('DeadlockDetected') ||
+                          lastError.message.includes("can't acquire") ||
+                          lastError.message.includes('ExclusiveLock') ||
+                          lastError.message.includes('ForsetiClient');
+        
+        if (isDeadlock && attempt < maxRetries) {
+          // Wait with exponential backoff before retry
+          const waitMs = Math.min(100 * Math.pow(2, attempt), 2000);
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+          continue;
+        }
+        
+        // Not a deadlock or max retries reached, throw the error
+        throw lastError;
+      }
+    }
+    
+    throw lastError || new Error('Failed to store relationship after retries');
   }
 
   async validateRemoteRepository(gitUrl: string): Promise<boolean> {

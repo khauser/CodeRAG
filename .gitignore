@@ -127,6 +127,12 @@ junit.xml
 *.swo
 *~
 
+# Eclipse project files
+bin/
+.settings/
+.classpath
+.project
+
 # OS generated files
 .DS_Store
 .DS_Store?

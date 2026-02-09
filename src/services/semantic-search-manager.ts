@@ -24,7 +24,7 @@ export class SemanticSearchManager {
       // Create vector index for semantic embeddings
       const indexQuery = `
         CREATE VECTOR INDEX semantic_embeddings IF NOT EXISTS
-        FOR (n:CodeEntity)
+        FOR (n:CodeNode)
         ON (n.semantic_embedding)
         OPTIONS {
           indexConfig: {
@@ -47,7 +47,7 @@ export class SemanticSearchManager {
 
   async addEmbeddingToNode(nodeId: string, projectId: string, embedding: SemanticEmbedding): Promise<void> {
     const query = `
-      MATCH (n:CodeEntity {id: $nodeId, project_id: $projectId})
+      MATCH (n:CodeNode {id: $nodeId, project_id: $projectId})
       SET n.semantic_embedding = $vector,
           n.embedding_model = $model,
           n.embedding_version = $version,
@@ -104,7 +104,7 @@ export class SemanticSearchManager {
     }
 
     const searchQuery = `
-      MATCH (n:CodeEntity)
+      MATCH (n:CodeNode)
       WHERE ${whereClause}
       WITH n, vector.similarity.cosine(n.semantic_embedding, $queryVector) AS similarity
       WHERE similarity >= $threshold
@@ -150,8 +150,8 @@ export class SemanticSearchManager {
     for (const result of semanticResults) {
       // Get related nodes within maxHops
       const contextQuery = `
-        MATCH (n:CodeEntity {id: $nodeId, project_id: $projectId})
-        MATCH (n)-[*1..${maxHops}]-(related:CodeEntity)
+        MATCH (n:CodeNode {id: $nodeId, project_id: $projectId})
+        MATCH (n)-[*1..${maxHops}]-(related:CodeNode)
         WHERE related.project_id = $projectId
         RETURN DISTINCT related
         LIMIT 5
@@ -189,7 +189,7 @@ export class SemanticSearchManager {
   async getSimilarNodes(nodeId: string, projectId: string, limit: number = 5): Promise<SemanticSearchResult[]> {
     // Get the embedding of the target node
     const nodeQuery = `
-      MATCH (n:CodeEntity {id: $nodeId, project_id: $projectId})
+      MATCH (n:CodeNode {id: $nodeId, project_id: $projectId})
       WHERE n.semantic_embedding IS NOT NULL
       RETURN n.semantic_embedding AS embedding, n
     `;
@@ -205,7 +205,7 @@ export class SemanticSearchManager {
 
     // Find similar nodes
     const similarQuery = `
-      MATCH (n:CodeEntity)
+      MATCH (n:CodeNode)
       WHERE n.semantic_embedding IS NOT NULL 
         AND n.project_id = $projectId 
         AND n.id <> $nodeId
@@ -256,7 +256,7 @@ export class SemanticSearchManager {
 
     // Get nodes that need embedding updates
     const query = `
-      MATCH (n:CodeEntity)
+      MATCH (n:CodeNode)
       WHERE ${whereClause}
       RETURN n
       ORDER BY n.id
