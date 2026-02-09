@@ -201,7 +201,10 @@ export class Neo4jClient {
 
   // Utility methods
   getProjectLabel(projectId: string, nodeType: string): string {
-    return `Project_${projectId}_${nodeType.charAt(0).toUpperCase() + nodeType.slice(1)}`;
+    // Sanitize project ID for use in Neo4j labels
+    // Neo4j labels can only contain alphanumeric characters and underscores
+    const sanitizedProjectId = projectId.replace(/[^a-zA-Z0-9_]/g, '_');
+    return `Project_${sanitizedProjectId}_${nodeType.charAt(0).toUpperCase() + nodeType.slice(1)}`;
   }
 
   generateProjectScopedId(projectId: string, entityId: string): string {

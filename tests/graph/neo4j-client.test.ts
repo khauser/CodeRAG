@@ -250,7 +250,8 @@ describe('Neo4jClient', () => {
   describe('utility methods', () => {
     test('should generate project label', () => {
       const label = client.getProjectLabel('test-project', 'class');
-      expect(label).toBe('Project_test-project_Class');
+      // Hyphens should be replaced with underscores for valid Neo4j labels
+      expect(label).toBe('Project_test_project_Class');
     });
 
     test('should generate project scoped ID', () => {

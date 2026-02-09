@@ -84,7 +84,8 @@ describe('Simple Component Tests', () => {
     test('should generate project labels correctly', () => {
       const client = new Neo4jClient({ uri: 'bolt://localhost:7687', user: 'test', password: 'test' });
       
-      expect(client.getProjectLabel('my-project', 'class')).toBe('Project_my-project_Class');
+      // Hyphens should be replaced with underscores for valid Neo4j labels
+      expect(client.getProjectLabel('my-project', 'class')).toBe('Project_my_project_Class');
       expect(client.getProjectLabel('test_proj', 'method')).toBe('Project_test_proj_Method');
     });
 

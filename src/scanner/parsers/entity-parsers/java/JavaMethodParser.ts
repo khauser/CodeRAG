@@ -56,7 +56,8 @@ export class JavaMethodParser {
       addRelationship(RelationshipBuilder.createContains(containingClass.id, methodId, filePath));
 
       // Parse method calls and create call relationships
-      this.parseMethodCalls(content, parsedMethod, methodId, packageName, extractionResult.imports, addRelationship, filePath);
+      // Pass the containing class qualified name for proper internal method resolution
+      this.parseMethodCalls(content, parsedMethod, methodId, containingClass.qualified_name, extractionResult.imports, addRelationship, filePath, entities);
     }
   }
 
@@ -78,30 +79,114 @@ export class JavaMethodParser {
     content: string, 
     method: any, 
     methodId: string, 
-    packageName: string,
+    containingClassName: string,
     imports: any[],
     addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
-    filePath: string
+    filePath: string,
+    entities: ParsedEntity[]
   ): void {
     if (!method.startLine || !method.endLine) return;
     
-    const methodBody = this.extractMethodBody(content, method.startLine, method.endLine);
+    let methodBody = this.extractMethodBody(content, method.startLine, method.endLine);
     
-    // Simple regex to find method calls - can be improved
-    const methodCallPattern = /([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+    // Remove annotations from the method body to avoid matching them as method calls
+    methodBody = methodBody.replace(/@[A-Za-z_][A-Za-z0-9_]*(\s*\([^)]*\))?/g, '');
+    
+    // Collect method names in the containing class for internal call resolution
+    const classMethodNames = new Set<string>();
+    for (const entity of entities) {
+      if (entity.type === 'method' && entity.qualified_name.startsWith(containingClassName + '.')) {
+        classMethodNames.add(entity.name);
+      }
+    }
+    
+    // 1. Find internal method calls (method calls without a receiver)
+    const simpleMethodCallPattern = /(?<![.\w])([a-z][A-Za-z0-9_]*)\s*\(/g;
     let match;
     
-    while ((match = methodCallPattern.exec(methodBody)) !== null) {
+    while ((match = simpleMethodCallPattern.exec(methodBody)) !== null) {
       const calledMethodName = match[1];
       
-      // Skip common Java keywords and built-in methods
       if (this.isBuiltInMethod(calledMethodName)) continue;
+      if (this.isCommonAnnotation(calledMethodName)) continue;
       
-      // Try to resolve the called method
-      const calledMethodId = this.resolveMethodCall(calledMethodName, packageName, imports);
-      
-      addRelationship(RelationshipBuilder.createCalls(methodId, calledMethodId, filePath));
+      // Only resolve internal method calls
+      if (classMethodNames.has(calledMethodName)) {
+        const calledMethodId = `${containingClassName}.${calledMethodName}`;
+        addRelationship(RelationshipBuilder.createCalls(methodId, calledMethodId, filePath));
+      }
     }
+    
+    // 2. Find class usages: new ClassName(...), ClassName.staticMethod(), (ClassName) cast
+    // This helps establish coupling between classes
+    const classUsagePatterns = [
+      /new\s+([A-Z][A-Za-z0-9_]*)\s*[<(]/g,           // new ClassName( or new ClassName<
+      /([A-Z][A-Za-z0-9_]*)\.(?![A-Z])[a-z][A-Za-z0-9_]*\s*\(/g,  // ClassName.method(
+      /\(\s*([A-Z][A-Za-z0-9_]*)\s*\)/g,              // (ClassName) cast
+    ];
+    
+    const referencedClasses = new Set<string>();
+    
+    for (const pattern of classUsagePatterns) {
+      pattern.lastIndex = 0;
+      while ((match = pattern.exec(methodBody)) !== null) {
+        const className = match[1];
+        
+        // Skip common Java types and annotations
+        if (this.isBuiltInMethod(className)) continue;
+        if (this.isCommonAnnotation(className)) continue;
+        if (this.isStandardJavaClass(className)) continue;
+        
+        referencedClasses.add(className);
+      }
+    }
+    
+    // Resolve and create relationships for referenced classes
+    const containingPackage = containingClassName.substring(0, containingClassName.lastIndexOf('.'));
+    for (const className of referencedClasses) {
+      const resolvedClass = this.resolveClassName(className, containingPackage, imports);
+      if (resolvedClass && !this.isStandardLibraryType(resolvedClass)) {
+        // Create a REFERENCES relationship from the method to the class
+        addRelationship(RelationshipBuilder.createReferences(methodId, resolvedClass, filePath));
+      }
+    }
+  }
+
+  private resolveClassName(className: string, packageName: string, imports: any[]): string | null {
+    // Check imports for the type
+    for (const imp of imports) {
+      if (imp.items?.includes(className) || imp.module.endsWith(`.${className}`)) {
+        return imp.module;
+      }
+      // Wildcard import
+      if (imp.items?.includes('*')) {
+        // We can't resolve wildcard imports reliably
+        continue;
+      }
+    }
+    
+    // Default to same package
+    return `${packageName}.${className}`;
+  }
+
+  private isStandardJavaClass(className: string): boolean {
+    const standardClasses = [
+      'String', 'Object', 'Class', 'Integer', 'Long', 'Double', 'Float', 
+      'Boolean', 'Byte', 'Short', 'Character', 'Number', 'Void',
+      'List', 'Set', 'Map', 'Collection', 'ArrayList', 'HashMap', 'HashSet',
+      'Optional', 'Stream', 'Arrays', 'Collections', 'Objects', 'Math',
+      'System', 'Runtime', 'Thread', 'Runnable', 'Exception', 'Error',
+      'StringBuilder', 'StringBuffer', 'Throwable'
+    ];
+    return standardClasses.includes(className);
+  }
+
+  private isStandardLibraryType(typeName: string): boolean {
+    const standardPackages = [
+      'java.', 'javax.', 'jakarta.', 'sun.', 'com.sun.', 
+      'org.w3c.', 'org.xml.'
+    ];
+    return standardPackages.some(pkg => typeName.startsWith(pkg));
   }
 
   private extractMethodBody(content: string, startLine: number, endLine: number): string {
@@ -121,9 +206,36 @@ export class JavaMethodParser {
     return builtInMethods.includes(methodName);
   }
 
-  private resolveMethodCall(methodName: string, packageName: string, imports: any[]): string {
-    // Simple resolution - can be enhanced with more sophisticated type analysis
-    return `${packageName}.${methodName}`;
+  private isCommonAnnotation(name: string): boolean {
+    // Common Java/Framework annotations that might be incorrectly picked up
+    const commonAnnotations = [
+      // JAXB annotations
+      'XmlRootElement', 'XmlElement', 'XmlAttribute', 'XmlAccessorType', 
+      'XmlType', 'XmlTransient', 'XmlElementWrapper', 'XmlSchema',
+      // Jackson annotations
+      'JsonProperty', 'JsonIgnore', 'JsonInclude', 'JsonFormat', 
+      'JsonSerialize', 'JsonDeserialize', 'JsonCreator', 'JsonValue',
+      // JPA/Hibernate annotations
+      'Entity', 'Table', 'Column', 'Id', 'GeneratedValue', 'ManyToOne',
+      'OneToMany', 'ManyToMany', 'OneToOne', 'JoinColumn', 'Transient',
+      // Spring annotations
+      'Autowired', 'Component', 'Service', 'Repository', 'Controller',
+      'RestController', 'RequestMapping', 'GetMapping', 'PostMapping',
+      'PutMapping', 'DeleteMapping', 'PathVariable', 'RequestBody',
+      'RequestParam', 'Bean', 'Configuration', 'Value', 'Inject',
+      // Lombok annotations
+      'Data', 'Getter', 'Setter', 'Builder', 'NoArgsConstructor',
+      'AllArgsConstructor', 'RequiredArgsConstructor', 'ToString', 'EqualsAndHashCode',
+      // Validation annotations
+      'NotNull', 'NotEmpty', 'NotBlank', 'Size', 'Min', 'Max', 'Valid',
+      'Pattern', 'Email', 'Past', 'Future',
+      // Other common annotations
+      'Override', 'Deprecated', 'SuppressWarnings', 'FunctionalInterface',
+      'SafeVarargs', 'Nullable', 'NonNull', 'Nonnull', 'Test', 'Before', 
+      'After', 'BeforeEach', 'AfterEach', 'Mock', 'InjectMocks', 'Spy'
+    ];
+    
+    return commonAnnotations.includes(name);
   }
 
   private extractAnnotations(content: string, startLine: number): any[] {
