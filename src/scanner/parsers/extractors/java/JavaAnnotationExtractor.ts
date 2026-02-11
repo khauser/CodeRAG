@@ -48,6 +48,72 @@ export class JavaAnnotationExtractor extends BaseAnnotationExtractor {
     return { annotations, errors };
   }
 
+  /**
+   * Extract annotations for a specific line number.
+   * This handles both inline annotations (on the same line as the declaration)
+   * and annotations on previous lines.
+   */
+  extractAnnotationsForLine(content: string, lineNumber: number): AnnotationInfo[] {
+    const annotations: AnnotationInfo[] = [];
+    const lines = content.split('\n');
+    
+    if (lineNumber < 1 || lineNumber > lines.length) {
+      return annotations;
+    }
+    
+    // First, check for annotations on the same line as the declaration (inline)
+    const declarationLine = lines[lineNumber - 1];
+    const inlineMatches = declarationLine.matchAll(/@([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]*)\))?/g);
+    for (const match of inlineMatches) {
+      const annotationName = match[1];
+      const parametersString = match[2];
+      
+      annotations.push({
+        name: `@${annotationName}`,
+        type: 'annotation',
+        parameters: this.parseAnnotationParameters(parametersString),
+        source_line: lineNumber,
+        framework: this.detectFramework(annotationName),
+        category: this.categorizeAnnotation(annotationName)
+      });
+    }
+    
+    // Then look backwards from the declaration for annotations on previous lines
+    for (let i = lineNumber - 2; i >= 0; i--) {
+      const line = lines[i].trim();
+      
+      // Skip empty lines and comment content
+      if (!line || this.isCommentLine(line)) continue;
+      
+      // Stop if we hit another declaration (field, method, or class)
+      if (line.endsWith(';') || line.endsWith('{') || line.endsWith('}')) {
+        break;
+      }
+      
+      if (this.isAnnotationLine(line)) {
+        const match = line.match(/@([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]*)\))?/);
+        if (match) {
+          const annotationName = match[1];
+          const parametersString = match[2];
+          
+          annotations.unshift({
+            name: `@${annotationName}`,
+            type: 'annotation',
+            parameters: this.parseAnnotationParameters(parametersString),
+            source_line: i + 1,
+            framework: this.detectFramework(annotationName),
+            category: this.categorizeAnnotation(annotationName)
+          });
+        }
+      } else {
+        // Stop on non-annotation content
+        break;
+      }
+    }
+    
+    return annotations;
+  }
+
   parseAnnotationParameters(parametersString?: string): ParsedAnnotationParameter[] {
     if (!parametersString || !parametersString.trim()) {
       return [];

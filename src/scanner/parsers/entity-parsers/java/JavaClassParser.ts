@@ -1,15 +1,14 @@
 import { ParsedEntity, ParsedRelationship } from '../../../types.js';
+import { AnnotationInfo } from '../../../../types.js';
 import { EntityFactory } from '../../base/EntityFactory.js';
 import { RelationshipBuilder } from '../../base/RelationshipBuilder.js';
 import { JavaContentExtractor } from '../../extractors/java/JavaContentExtractor.js';
 import { JavaDocExtractor } from '../../extractors/java/JavaDocExtractor.js';
-import { JavaFrameworkDetector } from '../../framework-detection/java/JavaFrameworkDetector.js';
 import { JavaAnnotationExtractor } from '../../extractors/java/JavaAnnotationExtractor.js';
 
 export class JavaClassParser {
   private contentExtractor = new JavaContentExtractor();
   private docExtractor = new JavaDocExtractor();
-  private frameworkDetector = new JavaFrameworkDetector();
   private annotationExtractor = new JavaAnnotationExtractor();
 
   parseClasses(
@@ -32,11 +31,10 @@ export class JavaClassParser {
         ? this.docExtractor.extractDocumentation(content, this.getPositionFromLine(content, parsedClass.startLine))
         : undefined;
 
-      // Extract annotations using modular extractor
-      const annotationResult = this.annotationExtractor.extractAnnotations(content, this.getPositionFromLine(content, parsedClass.startLine || 1));
-      const annotations = annotationResult.annotations;
+      // Extract annotations using the shared annotation extractor
+      const annotations = this.annotationExtractor.extractAnnotationsForLine(content, parsedClass.startLine || 1);
 
-      // Create class entity
+      // Create class entity (without annotations as attributes - they become nodes)
       const classEntity = EntityFactory.createClass(
         classId,
         parsedClass.name,
@@ -46,10 +44,15 @@ export class JavaClassParser {
         parsedClass.endLine,
         parsedClass.modifiers,
         documentation,
-        annotations
+        [] // No annotations as attributes - they are now nodes
       );
 
       addEntity(classEntity);
+
+      // Create annotation nodes and ANNOTATED_WITH relationships
+      this.createAnnotationNodesAndRelationships(
+        classId, annotations, filePath, packageName, addEntity, addRelationship
+      );
 
       // Create package relationships (bidirectional for better graph traversal)
       const packageId = packageName;
@@ -87,6 +90,47 @@ export class JavaClassParser {
         addRelationship, 
         filePath
       );
+    }
+  }
+
+  /**
+   * Creates Annotation nodes and ANNOTATED_WITH relationships for a class.
+   * Each annotation on the class becomes a separate node in the graph.
+   */
+  private createAnnotationNodesAndRelationships(
+    classId: string,
+    annotations: AnnotationInfo[],
+    filePath: string,
+    packageName: string,
+    addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+  ): void {
+    for (const annotation of annotations) {
+      // Create unique annotation node ID based on class and annotation name
+      const annotationId = `${classId}@${annotation.name}`;
+      const qualifiedName = `${packageName}.${annotation.name}`;
+
+      // Create annotation node
+      const annotationEntity = EntityFactory.createAnnotation(
+        annotationId,
+        annotation.name,
+        qualifiedName,
+        filePath,
+        annotation.source_line,
+        annotation.framework,
+        annotation.category,
+        annotation.parameters
+      );
+
+      addEntity(annotationEntity);
+
+      // Create ANNOTATED_WITH relationship from class to annotation
+      addRelationship(RelationshipBuilder.createAnnotatedWith(
+        classId, 
+        annotationId, 
+        filePath, 
+        { source_line: annotation.source_line }
+      ));
     }
   }
 
@@ -186,34 +230,6 @@ export class JavaClassParser {
     }
     
     return types;
-  }
-
-  private extractAnnotations(content: string, startLine: number): any[] {
-    const annotations: any[] = [];
-    const lines = content.split('\n');
-    
-    // Look backwards from the class declaration for annotations
-    for (let i = startLine - 2; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line || line.startsWith('//') || line.startsWith('/*')) continue;
-      
-      const annotationMatch = line.match(/@([A-Za-z_][A-Za-z0-9_]*)/);
-      if (annotationMatch) {
-        const annotationName = annotationMatch[1];
-        const framework = this.frameworkDetector.detectFramework(annotationName) || 'Unknown';
-        const category = this.frameworkDetector.categorizeAnnotation(annotationName) || 'unknown';
-        
-        annotations.unshift({
-          name: annotationName,
-          framework,
-          category
-        });
-      } else if (line && !line.startsWith('@')) {
-        break; // Stop at non-annotation content
-      }
-    }
-    
-    return annotations;
   }
 
   private resolveType(typeName: string, packageName: string, imports: any[]): string {

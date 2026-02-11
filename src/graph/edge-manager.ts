@@ -207,6 +207,160 @@ export class EdgeManager {
     return result.records.length > 0 ? result.records[0].get('hierarchy') : [];
   }
 
+  /**
+   * Find all methods declared by a specific class
+   * Uses the CONTAINS relationship: (:Class)-[:CONTAINS]->(:Method)
+   */
+  async findMethodsOfClass(className: string, projectId: string): Promise<{ name: string; qualifiedName: string; returnType?: string }[]> {
+    const query = `
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS {project_id: $project_id}]->
+      (method:CodeNode {type: 'method', project_id: $project_id})
+      WHERE class.name = $className OR class.qualified_name = $className
+      RETURN method.name as name, method.qualified_name as qualifiedName, method.attributes_json as attributes
+      ORDER BY name
+    `;
+    
+    const result = await this.client.runQuery(query, { className, project_id: projectId });
+    return result.records.map(record => {
+      const attributes = record.get('attributes') ? JSON.parse(record.get('attributes')) : {};
+      return {
+        name: record.get('name'),
+        qualifiedName: record.get('qualifiedName'),
+        returnType: attributes.return_type
+      };
+    });
+  }
+
+  /**
+   * Find all fields declared by a specific class
+   * Uses the CONTAINS relationship: (:Class)-[:CONTAINS]->(:Field)
+   */
+  async findFieldsOfClass(className: string, projectId: string): Promise<{ name: string; qualifiedName: string; type?: string }[]> {
+    const query = `
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS {project_id: $project_id}]->
+      (field:CodeNode {type: 'field', project_id: $project_id})
+      WHERE class.name = $className OR class.qualified_name = $className
+      RETURN field.name as name, field.qualified_name as qualifiedName, field.attributes_json as attributes
+      ORDER BY name
+    `;
+    
+    const result = await this.client.runQuery(query, { className, project_id: projectId });
+    return result.records.map(record => {
+      const attributes = record.get('attributes') ? JSON.parse(record.get('attributes')) : {};
+      return {
+        name: record.get('name'),
+        qualifiedName: record.get('qualifiedName'),
+        type: attributes.field_type
+      };
+    });
+  }
+
+  /**
+   * Find the class that contains/declares a specific method
+   */
+  async findClassOfMethod(methodName: string, projectId: string): Promise<{ name: string; qualifiedName: string } | null> {
+    const query = `
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS {project_id: $project_id}]->
+      (method:CodeNode {type: 'method', project_id: $project_id})
+      WHERE method.name = $methodName OR method.qualified_name = $methodName
+      RETURN class.name as name, class.qualified_name as qualifiedName
+      LIMIT 1
+    `;
+    
+    const result = await this.client.runQuery(query, { methodName, project_id: projectId });
+    if (result.records.length === 0) {
+      return null;
+    }
+    return {
+      name: result.records[0].get('name'),
+      qualifiedName: result.records[0].get('qualifiedName')
+    };
+  }
+
+  /**
+   * Find all classes annotated with a specific annotation
+   */
+  async findClassesAnnotatedWith(annotationName: string, projectId: string): Promise<string[]> {
+    const query = `
+      MATCH (class:Class {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
+      (annotation:Annotation {project_id: $project_id})
+      WHERE annotation.name = $annotationName OR annotation.name = '@' + $annotationName
+      RETURN DISTINCT class.name as className, class.qualified_name as qualifiedName
+      ORDER BY className
+    `;
+    
+    const result = await this.client.runQuery(query, { annotationName, project_id: projectId });
+    return result.records.map(record => record.get('qualifiedName') || record.get('className'));
+  }
+
+  /**
+   * Find all methods annotated with a specific annotation
+   */
+  async findMethodsAnnotatedWith(annotationName: string, projectId: string): Promise<string[]> {
+    const query = `
+      MATCH (method:Method {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
+      (annotation:Annotation {project_id: $project_id})
+      WHERE annotation.name = $annotationName OR annotation.name = '@' + $annotationName
+      RETURN DISTINCT method.name as methodName, method.qualified_name as qualifiedName
+      ORDER BY methodName
+    `;
+    
+    const result = await this.client.runQuery(query, { annotationName, project_id: projectId });
+    return result.records.map(record => record.get('qualifiedName') || record.get('methodName'));
+  }
+
+  /**
+   * Find all annotations used on a specific class
+   */
+  async findAnnotationsOnClass(className: string, projectId: string): Promise<string[]> {
+    const query = `
+      MATCH (class:Class {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
+      (annotation:Annotation {project_id: $project_id})
+      WHERE class.name = $className OR class.qualified_name = $className
+      RETURN DISTINCT annotation.name as annotationName
+      ORDER BY annotationName
+    `;
+    
+    const result = await this.client.runQuery(query, { className, project_id: projectId });
+    return result.records.map(record => record.get('annotationName'));
+  }
+
+  /**
+   * Find all annotations used on a specific method
+   */
+  async findAnnotationsOnMethod(methodName: string, projectId: string): Promise<string[]> {
+    const query = `
+      MATCH (method:Method {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
+      (annotation:Annotation {project_id: $project_id})
+      WHERE method.name = $methodName OR method.qualified_name = $methodName
+      RETURN DISTINCT annotation.name as annotationName
+      ORDER BY annotationName
+    `;
+    
+    const result = await this.client.runQuery(query, { methodName, project_id: projectId });
+    return result.records.map(record => record.get('annotationName'));
+  }
+
+  /**
+   * Find all elements (classes and methods) annotated with a specific framework annotation
+   */
+  async findElementsByFrameworkAnnotation(framework: string, projectId: string): Promise<{ type: string; name: string; annotation: string }[]> {
+    const query = `
+      MATCH (element:CodeNode {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
+      (annotation:Annotation {project_id: $project_id})
+      WHERE annotation.framework = $framework
+      RETURN element.type as type, element.name as name, element.qualified_name as qualifiedName, annotation.name as annotation
+      ORDER BY element.type, element.name
+    `;
+    
+    const result = await this.client.runQuery(query, { framework, project_id: projectId });
+    return result.records.map(record => ({
+      type: record.get('type'),
+      name: record.get('qualifiedName') || record.get('name'),
+      annotation: record.get('annotation')
+    }));
+  }
+
   // Cross-project methods (use with caution)
   async findEdgesByTypeAcrossProjects(type: CodeEdge['type']): Promise<CodeEdge[]> {
     const query = `

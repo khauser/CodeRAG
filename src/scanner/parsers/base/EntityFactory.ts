@@ -210,4 +210,32 @@ export class EntityFactory {
       annotations: annotations || []
     };
   }
+
+  static createAnnotation(
+    id: string,
+    name: string,
+    qualifiedName: string,
+    sourceFile: string,
+    startLine?: number,
+    framework?: string,
+    category?: string,
+    parameters?: Array<{ name?: string; value: string; type?: string }>
+  ): Omit<ParsedEntity, 'project_id'> {
+    return {
+      id,
+      type: 'annotation',
+      name,
+      qualified_name: qualifiedName,
+      source_file: sourceFile,
+      start_line: startLine,
+      end_line: startLine,
+      modifiers: [],
+      attributes: {
+        framework,
+        category,
+        // Store annotation parameters separately to avoid type conflicts with method parameters
+        annotation_parameters: parameters
+      }
+    };
+  }
 }

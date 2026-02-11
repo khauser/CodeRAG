@@ -1,14 +1,15 @@
 import { ParsedEntity, ParsedRelationship } from '../../../types.js';
+import { AnnotationInfo } from '../../../../types.js';
 import { EntityFactory } from '../../base/EntityFactory.js';
 import { RelationshipBuilder } from '../../base/RelationshipBuilder.js';
 import { JavaContentExtractor } from '../../extractors/java/JavaContentExtractor.js';
 import { JavaDocExtractor } from '../../extractors/java/JavaDocExtractor.js';
-import { JavaFrameworkDetector } from '../../framework-detection/java/JavaFrameworkDetector.js';
+import { JavaAnnotationExtractor } from '../../extractors/java/JavaAnnotationExtractor.js';
 
 export class JavaMethodParser {
   private contentExtractor = new JavaContentExtractor();
   private docExtractor = new JavaDocExtractor();
-  private frameworkDetector = new JavaFrameworkDetector();
+  private annotationExtractor = new JavaAnnotationExtractor();
 
   parseMethods(
     content: string, 
@@ -34,10 +35,10 @@ export class JavaMethodParser {
         ? this.docExtractor.extractDocumentation(content, this.getPositionFromLine(content, parsedMethod.startLine))
         : undefined;
 
-      // Extract annotations
-      const annotations = this.extractAnnotations(content, parsedMethod.startLine || 1);
+      // Extract annotations using the shared annotation extractor
+      const annotations = this.annotationExtractor.extractAnnotationsForLine(content, parsedMethod.startLine || 1);
 
-      // Create method entity
+      // Create method entity (without annotations as attributes - they become nodes)
       const methodEntity = EntityFactory.createMethod(
         methodId,
         parsedMethod.name,
@@ -47,10 +48,15 @@ export class JavaMethodParser {
         parsedMethod.endLine,
         parsedMethod.modifiers,
         documentation,
-        annotations
+        [] // No annotations as attributes - they are now nodes
       );
 
       addEntity(methodEntity);
+
+      // Create annotation nodes and ANNOTATED_WITH relationships for method
+      this.createAnnotationNodesAndRelationships(
+        methodId, annotations, filePath, containingClass.qualified_name, addEntity, addRelationship
+      );
 
       // Create containment relationship
       addRelationship(RelationshipBuilder.createContains(containingClass.id, methodId, filePath));
@@ -238,34 +244,6 @@ export class JavaMethodParser {
     return commonAnnotations.includes(name);
   }
 
-  private extractAnnotations(content: string, startLine: number): any[] {
-    const annotations: any[] = [];
-    const lines = content.split('\n');
-    
-    // Look backwards from the method declaration for annotations
-    for (let i = startLine - 2; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line || line.startsWith('//') || line.startsWith('/*')) continue;
-      
-      const annotationMatch = line.match(/@([A-Za-z_][A-Za-z0-9_]*)/);
-      if (annotationMatch) {
-        const annotationName = annotationMatch[1];
-        const framework = this.frameworkDetector.detectFramework(annotationName) || 'Unknown';
-        const category = this.frameworkDetector.categorizeAnnotation(annotationName) || 'unknown';
-        
-        annotations.unshift({
-          name: annotationName,
-          framework,
-          category
-        });
-      } else if (line && !line.startsWith('@')) {
-        break; // Stop at non-annotation content
-      }
-    }
-    
-    return annotations;
-  }
-
   private getPositionFromLine(content: string, lineNumber: number): number {
     const lines = content.split('\n');
     let position = 0;
@@ -275,5 +253,46 @@ export class JavaMethodParser {
     }
     
     return position;
+  }
+
+  /**
+   * Creates Annotation nodes and ANNOTATED_WITH relationships for a method.
+   * Each annotation on the method becomes a separate node in the graph.
+   */
+  private createAnnotationNodesAndRelationships(
+    methodId: string,
+    annotations: AnnotationInfo[],
+    filePath: string,
+    packageName: string,
+    addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+  ): void {
+    for (const annotation of annotations) {
+      // Create unique annotation node ID based on method and annotation name
+      const annotationId = `${methodId}@${annotation.name}`;
+      const qualifiedName = `${packageName}.${annotation.name}`;
+
+      // Create annotation node
+      const annotationEntity = EntityFactory.createAnnotation(
+        annotationId,
+        annotation.name,
+        qualifiedName,
+        filePath,
+        annotation.source_line,
+        annotation.framework,
+        annotation.category,
+        annotation.parameters
+      );
+
+      addEntity(annotationEntity);
+
+      // Create ANNOTATED_WITH relationship from method to annotation
+      addRelationship(RelationshipBuilder.createAnnotatedWith(
+        methodId, 
+        annotationId, 
+        filePath, 
+        { source_line: annotation.source_line }
+      ));
+    }
   }
 }

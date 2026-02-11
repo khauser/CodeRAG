@@ -9,6 +9,7 @@ import { SemanticSearchManager } from '../services/semantic-search-manager.js';
 import { TypeScriptParser } from './parsers/typescript-parser.js';
 import { JavaParser } from './parsers/java-parser.js';
 import { PythonParser } from './parsers/python-parser.js';
+import { PipelineParser } from './parsers/pipeline-parser.js';
 import { 
   ScanConfig, 
   ParseResult, 
@@ -171,20 +172,47 @@ export class CodebaseScanner {
   async clearGraph(projectId?: string): Promise<void> {
     if (projectId) {
       console.log(`🗑️  Clearing graph data for project '${projectId}'...`);
-      const query = `
-        MATCH (n:CodeNode {project_id: $project_id})
-        OPTIONAL MATCH (n)-[r {project_id: $project_id}]-()
-        DELETE n, r
-      `;
-      await this.client.runQuery(query, { project_id: projectId });
+      // Delete in batches to avoid transaction memory limit
+      let deletedCount = 0;
+      let batchCount = 0;
+      
+      do {
+        const result = await this.client.runQuery(`
+          MATCH (n:CodeNode {project_id: $project_id})
+          WITH n LIMIT 10000
+          DETACH DELETE n
+          RETURN count(*) as deleted
+        `, { project_id: projectId });
+        
+        deletedCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
+        batchCount++;
+        if (deletedCount > 0) {
+          console.log(`   Batch ${batchCount}: deleted ${deletedCount} nodes...`);
+        }
+      } while (deletedCount > 0);
+      
       console.log(`✅ Project '${projectId}' graph data cleared`);
     } else {
       console.log(`🗑️  Clearing all graph data...`);
-      const query = `
-        MATCH (n)
-        DETACH DELETE n
-      `;
-      await this.client.runQuery(query);
+      // Delete in batches to avoid transaction memory limit
+      let deletedCount = 0;
+      let batchCount = 0;
+      
+      do {
+        const result = await this.client.runQuery(`
+          MATCH (n)
+          WITH n LIMIT 10000
+          DETACH DELETE n
+          RETURN count(*) as deleted
+        `, {});
+        
+        deletedCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
+        batchCount++;
+        if (deletedCount > 0) {
+          console.log(`   Batch ${batchCount}: deleted ${deletedCount} nodes...`);
+        }
+      } while (deletedCount > 0);
+      
       console.log(`✅ All graph data cleared`);
     }
   }
