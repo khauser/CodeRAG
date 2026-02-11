@@ -1,15 +1,14 @@
 import { ParsedEntity, ParsedRelationship } from '../../../types.js';
+import { AnnotationInfo } from '../../../../types.js';
 import { EntityFactory } from '../../base/EntityFactory.js';
 import { RelationshipBuilder } from '../../base/RelationshipBuilder.js';
 import { JavaContentExtractor } from '../../extractors/java/JavaContentExtractor.js';
 import { JavaDocExtractor } from '../../extractors/java/JavaDocExtractor.js';
-import { JavaFrameworkDetector } from '../../framework-detection/java/JavaFrameworkDetector.js';
 import { JavaAnnotationExtractor } from '../../extractors/java/JavaAnnotationExtractor.js';
 
 export class JavaClassParser {
   private contentExtractor = new JavaContentExtractor();
   private docExtractor = new JavaDocExtractor();
-  private frameworkDetector = new JavaFrameworkDetector();
   private annotationExtractor = new JavaAnnotationExtractor();
 
   parseClasses(
@@ -32,11 +31,10 @@ export class JavaClassParser {
         ? this.docExtractor.extractDocumentation(content, this.getPositionFromLine(content, parsedClass.startLine))
         : undefined;
 
-      // Extract annotations using modular extractor
-      const annotationResult = this.annotationExtractor.extractAnnotations(content, this.getPositionFromLine(content, parsedClass.startLine || 1));
-      const annotations = annotationResult.annotations;
+      // Extract annotations using the shared annotation extractor
+      const annotations = this.annotationExtractor.extractAnnotationsForLine(content, parsedClass.startLine || 1);
 
-      // Create class entity
+      // Create class entity (without annotations as attributes - they become nodes)
       const classEntity = EntityFactory.createClass(
         classId,
         parsedClass.name,
@@ -46,10 +44,15 @@ export class JavaClassParser {
         parsedClass.endLine,
         parsedClass.modifiers,
         documentation,
-        annotations
+        [] // No annotations as attributes - they are now nodes
       );
 
       addEntity(classEntity);
+
+      // Create annotation nodes and ANNOTATED_WITH relationships
+      this.createAnnotationNodesAndRelationships(
+        classId, annotations, filePath, packageName, addEntity, addRelationship
+      );
 
       // Create package relationships (bidirectional for better graph traversal)
       const packageId = packageName;
@@ -134,6 +137,131 @@ export class JavaClassParser {
           }
         }
       }
+
+      // Create class-level type references from methods and fields
+      this.createClassTypeReferences(
+        classId, 
+        packageName, 
+        extractionResult, 
+        parsedClass,
+        addRelationship, 
+        filePath
+      );
+    }
+  }
+
+  /**
+   * Creates Annotation nodes and ANNOTATED_WITH relationships for a class.
+   * Each annotation on the class becomes a separate node in the graph.
+   */
+  private createAnnotationNodesAndRelationships(
+    classId: string,
+    annotations: AnnotationInfo[],
+    filePath: string,
+    packageName: string,
+    addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+  ): void {
+    for (const annotation of annotations) {
+      // Create unique annotation node ID based on class and annotation name
+      const annotationId = `${classId}@${annotation.name}`;
+      const qualifiedName = `${packageName}.${annotation.name}`;
+
+      // Create annotation node
+      const annotationEntity = EntityFactory.createAnnotation(
+        annotationId,
+        annotation.name,
+        qualifiedName,
+        filePath,
+        annotation.source_line,
+        annotation.framework,
+        annotation.category,
+        annotation.parameters
+      );
+
+      addEntity(annotationEntity);
+
+      // Create ANNOTATED_WITH relationship from class to annotation
+      addRelationship(RelationshipBuilder.createAnnotatedWith(
+        classId, 
+        annotationId, 
+        filePath, 
+        { source_line: annotation.source_line }
+      ));
+    }
+  }
+
+  /**
+   * Creates REFERENCES relationships from a class to all types it uses in:
+   * - Method return types
+   * - Method parameter types
+   * - Field types
+   * 
+   * This provides better class-level coupling information for metrics like CBO.
+   */
+  private createClassTypeReferences(
+    classId: string,
+    packageName: string,
+    extractionResult: ReturnType<JavaContentExtractor['extractContent']>,
+    parsedClass: { startLine?: number; endLine?: number },
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
+    filePath: string
+  ): void {
+    const referencedTypes = new Set<string>();
+
+    // Collect types from method return types and parameters
+    for (const method of extractionResult.functions) {
+      // Only process methods that belong to this class (by line number range)
+      // If startLine === endLine, we don't have proper class bounds, so we can't filter by line number
+      if (parsedClass.startLine && parsedClass.endLine && method.startLine &&
+          parsedClass.startLine !== parsedClass.endLine) {
+        if (method.startLine < parsedClass.startLine || method.startLine > parsedClass.endLine) {
+          continue;
+        }
+      }
+
+      // Add return type
+      if (method.returnType) {
+        const types = this.extractTypesFromTypeString(method.returnType);
+        types.forEach(t => referencedTypes.add(t));
+      }
+
+      // Add parameter types
+      if (method.parameters) {
+        for (const param of method.parameters) {
+          if (param.type) {
+            const types = this.extractTypesFromTypeString(param.type);
+            types.forEach(t => referencedTypes.add(t));
+          }
+        }
+      }
+    }
+
+    // Collect types from field types
+    for (const field of extractionResult.fields) {
+      // Only process fields that belong to this class
+      // If startLine === endLine, we don't have proper class bounds, so we can't filter by line number
+      if (parsedClass.startLine && parsedClass.endLine && field.startLine && 
+          parsedClass.startLine !== parsedClass.endLine) {
+        if (field.startLine < parsedClass.startLine || field.startLine > parsedClass.endLine) {
+          continue;
+        }
+      }
+
+      if (field.type) {
+        const types = this.extractTypesFromTypeString(field.type);
+        types.forEach(t => referencedTypes.add(t));
+      }
+    }
+
+    // Create REFERENCES relationships for each unique type
+    for (const typeName of referencedTypes) {
+      const resolvedType = this.resolveType(typeName, packageName, extractionResult.imports);
+      
+      // Skip standard library types and self-references
+      if (!this.isStandardLibraryType(resolvedType) && resolvedType !== classId) {
+        addRelationship(RelationshipBuilder.createReferences(classId, resolvedType, filePath));
+      }
     }
 
     // Collect types from field types
@@ -188,32 +316,28 @@ export class JavaClassParser {
     return types;
   }
 
-  private extractAnnotations(content: string, startLine: number): any[] {
-    const annotations: any[] = [];
-    const lines = content.split('\n');
+  /**
+   * Extracts all type names from a type string, handling generics.
+   * E.g., "Map<String, List<PunchoutItemRO>>" returns ["Map", "String", "List", "PunchoutItemRO"]
+   */
+  private extractTypesFromTypeString(typeString: string): string[] {
+    const types: string[] = [];
     
-    // Look backwards from the class declaration for annotations
-    for (let i = startLine - 2; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line || line.startsWith('//') || line.startsWith('/*')) continue;
-      
-      const annotationMatch = line.match(/@([A-Za-z_][A-Za-z0-9_]*)/);
-      if (annotationMatch) {
-        const annotationName = annotationMatch[1];
-        const framework = this.frameworkDetector.detectFramework(annotationName) || 'Unknown';
-        const category = this.frameworkDetector.categorizeAnnotation(annotationName) || 'unknown';
-        
-        annotations.unshift({
-          name: annotationName,
-          framework,
-          category
-        });
-      } else if (line && !line.startsWith('@')) {
-        break; // Stop at non-annotation content
+    // Remove array brackets
+    const cleaned = typeString.replace(/\[\]/g, '');
+    
+    // Split by generic delimiters and commas
+    const parts = cleaned.split(/[<>,\s]+/);
+    
+    for (const part of parts) {
+      const trimmed = part.trim();
+      // Only include valid class names (starting with uppercase)
+      if (trimmed && /^[A-Z][A-Za-z0-9_$]*$/.test(trimmed)) {
+        types.push(trimmed);
       }
     }
     
-    return annotations;
+    return types;
   }
 
   private resolveType(typeName: string, packageName: string, imports: any[]): string {

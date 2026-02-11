@@ -6,7 +6,6 @@ import { JavaContentExtractor } from './extractors/java/JavaContentExtractor.js'
 import { JavaClassParser } from './entity-parsers/java/JavaClassParser.js';
 import { JavaMethodParser } from './entity-parsers/java/JavaMethodParser.js';
 import { JavaFieldParser } from './entity-parsers/java/JavaFieldParser.js';
-import { JavaAnnotationExtractor } from './extractors/java/JavaAnnotationExtractor.js';
 import { JavaMethodCallExtractor } from './extractors/java/JavaMethodCallExtractor.js';
 import { ParsedEntity, ParsedRelationship, ParseError } from '../types.js';
 
@@ -15,7 +14,6 @@ export class JavaParser extends BaseLanguageParser {
   private classParser = new JavaClassParser();
   private methodParser = new JavaMethodParser();
   private fieldParser = new JavaFieldParser();
-  private annotationExtractor = new JavaAnnotationExtractor();
   private methodCallExtractor = new JavaMethodCallExtractor();
   private createdPackages: Map<string, Set<string>> = new Map();
 

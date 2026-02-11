@@ -150,5 +150,105 @@ public class TestClass {
       expect(keyTypeRefs.length).toBeGreaterThanOrEqual(1);
       expect(valueTypeRefs.length).toBeGreaterThanOrEqual(1);
     });
+
+    test('should create annotation nodes and ANNOTATED_WITH relationships for fields', async () => {
+      const javaCode = `
+        package com.example.pipelet;
+        
+        public class MyPipelet {
+          @PipelineNodeOutput
+          private Yes yes;
+          
+          @PipelineNodeOutput  
+          private No no;
+          
+          interface Yes {}
+          interface No {}
+        }
+      `;
+
+      const result = await parser.parseFile(filePath, javaCode, projectId);
+
+      // Find annotation entities
+      const annotationEntities = result.entities.filter(e => e.type === 'annotation');
+      const pipelineNodeOutputAnnotations = annotationEntities.filter(e => e.name === '@PipelineNodeOutput');
+      
+      // Should have 2 @PipelineNodeOutput annotations (one for each field)
+      expect(pipelineNodeOutputAnnotations.length).toBe(2);
+
+      // Find ANNOTATED_WITH relationships
+      const annotatedWithRelationships = result.relationships.filter(r => r.type === 'annotated_with');
+      
+      // Should have relationships from fields to annotations
+      const yesFieldAnnotations = annotatedWithRelationships.filter(r => r.source.includes('.yes'));
+      const noFieldAnnotations = annotatedWithRelationships.filter(r => r.source.includes('.no'));
+      
+      expect(yesFieldAnnotations.length).toBe(1);
+      expect(noFieldAnnotations.length).toBe(1);
+      
+      // Verify the annotation targets contain @PipelineNodeOutput
+      expect(yesFieldAnnotations[0].target).toContain('@PipelineNodeOutput');
+      expect(noFieldAnnotations[0].target).toContain('@PipelineNodeOutput');
+    });
+
+    test('should create annotation nodes and ANNOTATED_WITH relationships for methods', async () => {
+      const javaCode = `
+        package com.example.pipelet;
+        
+        public class MyPipelet {
+          @PipelineNodeInput(name = "Input")
+          public Object execute(Input input) {
+            return null;
+          }
+          
+          interface Input {}
+        }
+      `;
+
+      const result = await parser.parseFile(filePath, javaCode, projectId);
+
+      // Find annotation entities
+      const annotationEntities = result.entities.filter(e => e.type === 'annotation');
+      const pipelineNodeInputAnnotations = annotationEntities.filter(e => e.name === '@PipelineNodeInput');
+      
+      // Should have 1 @PipelineNodeInput annotation
+      expect(pipelineNodeInputAnnotations.length).toBe(1);
+
+      // Find ANNOTATED_WITH relationships
+      const annotatedWithRelationships = result.relationships.filter(r => r.type === 'annotated_with');
+      
+      // Should have relationship from execute method to annotation
+      const executeMethodAnnotations = annotatedWithRelationships.filter(r => r.source.includes('.execute'));
+      
+      expect(executeMethodAnnotations.length).toBe(1);
+      expect(executeMethodAnnotations[0].target).toContain('@PipelineNodeInput');
+    });
+
+    test('should handle inline annotations on same line as field declaration', async () => {
+      const javaCode = `
+        package com.example;
+        
+        public class TestClass {
+          @Inject private MyService service;
+          @Autowired private OtherService other;
+        }
+      `;
+
+      const result = await parser.parseFile(filePath, javaCode, projectId);
+
+      // Find annotation entities
+      const annotationEntities = result.entities.filter(e => e.type === 'annotation');
+      
+      // Should have both @Inject and @Autowired annotations
+      expect(annotationEntities.some(e => e.name === '@Inject')).toBe(true);
+      expect(annotationEntities.some(e => e.name === '@Autowired')).toBe(true);
+
+      // Find ANNOTATED_WITH relationships
+      const annotatedWithRelationships = result.relationships.filter(r => r.type === 'annotated_with');
+      
+      // Should have relationships for both fields
+      expect(annotatedWithRelationships.filter(r => r.source.includes('.service')).length).toBe(1);
+      expect(annotatedWithRelationships.filter(r => r.source.includes('.other')).length).toBe(1);
+    });
   });
 });

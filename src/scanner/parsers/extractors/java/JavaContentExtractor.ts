@@ -17,7 +17,8 @@ export class JavaContentExtractor extends BaseContentExtractor {
   private static readonly CLASS_PATTERN = /(?:(?:public|private|protected|static|final|abstract)\s+)*class\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:extends\s+([^{]+?))?\s*(?:implements\s+([^{]+?))?\s*\{/g;
   private static readonly INTERFACE_PATTERN = /(?:(?:public|private|protected|static)\s+)*interface\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:extends\s+([^{]+?))?\s*\{/g;
   private static readonly ENUM_PATTERN = /(?:(?:public|private|protected|static)\s+)*enum\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\{([^}]+)\}/g;
-  private static readonly METHOD_PATTERN = /(?:(?:public|private|protected|static|final|abstract|synchronized|native|strictfp)\s+)*(?:(<[^>]+>\s+))?([A-Za-z_$][A-Za-z0-9_$.<>,\[\]\s]*)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*(?:throws\s+([^{]+?))?\s*[{;]/g;
+  // Method pattern that properly handles annotations before method signatures
+  private static readonly METHOD_PATTERN = /(?:@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?\s*)*(?:(?:public|private|protected|static|final|abstract|synchronized|native|strictfp)\s+)*(?:(<[^>]+>\s+))?([A-Za-z_$][A-Za-z0-9_$.<>,\[\]]*)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*(?:throws\s+([^{]+?))?\s*[{;]/g;
   private static readonly FIELD_PATTERN = /(?:(?:public|private|protected|static|final|volatile|transient)\s+)+([A-Za-z_$][A-Za-z0-9_$.<>,\[\]\s]*)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:=\s*[^;]+)?\s*;/g;
 
   extractContent(content: string, filePath: string): ContentExtractionResult {
@@ -75,12 +76,13 @@ export class JavaContentExtractor extends BaseContentExtractor {
     while ((match = JavaContentExtractor.CLASS_PATTERN.exec(content)) !== null) {
       const [fullMatch, className, extendsClause, implementsClause] = match;
       const lineNumber = this.findLineNumber(content, className);
+      const endLineNumber = this.findClassEndLine(content, match.index);
       
       const parsedClass: ParsedClass = {
         name: className,
         modifiers: this.extractModifiersFromMatch(fullMatch),
         startLine: lineNumber,
-        endLine: lineNumber
+        endLine: endLineNumber || lineNumber
       };
 
       if (extendsClause) {
@@ -95,6 +97,41 @@ export class JavaContentExtractor extends BaseContentExtractor {
     }
 
     return classes;
+  }
+
+  /**
+   * Find the end line of a class by counting matching braces
+   */
+  private findClassEndLine(content: string, startOffset: number): number | undefined {
+    let braceCount = 0;
+    let foundFirstBrace = false;
+    let lineNumber = 1;
+    
+    // Count lines before startOffset
+    for (let i = 0; i < startOffset; i++) {
+      if (content[i] === '\n') {
+        lineNumber++;
+      }
+    }
+    
+    // Find matching closing brace
+    for (let i = startOffset; i < content.length; i++) {
+      const char = content[i];
+      
+      if (char === '\n') {
+        lineNumber++;
+      } else if (char === '{') {
+        braceCount++;
+        foundFirstBrace = true;
+      } else if (char === '}') {
+        braceCount--;
+        if (foundFirstBrace && braceCount === 0) {
+          return lineNumber;
+        }
+      }
+    }
+    
+    return undefined;
   }
 
   private extractInterfaces(content: string): ParsedInterface[] {

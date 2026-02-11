@@ -25,7 +25,7 @@ export type Language = 'typescript' | 'javascript' | 'java' | 'python' | 'csharp
 export interface ParsedEntity {
   id: string;
   project_id: string;
-  type: 'class' | 'interface' | 'enum' | 'exception' | 'function' | 'method' | 'field' | 'package' | 'module';
+  type: 'class' | 'interface' | 'enum' | 'exception' | 'function' | 'method' | 'field' | 'package' | 'module' | 'annotation';
   name: string;
   qualified_name: string;
   description?: string;
@@ -43,6 +43,8 @@ export interface ParsedEntity {
     return_type?: string;
     implements?: string[];
     extends?: string;
+    framework?: string;            // For annotation nodes: the framework (Spring, JUnit, etc.)
+    category?: string;             // For annotation nodes: the category (testing, injection, etc.)
     [key: string]: any;
   };
 }
@@ -50,7 +52,7 @@ export interface ParsedEntity {
 export interface ParsedRelationship {
   id: string;
   project_id: string;
-  type: 'calls' | 'implements' | 'extends' | 'contains' | 'references' | 'throws' | 'belongs_to';
+  type: 'calls' | 'implements' | 'extends' | 'contains' | 'references' | 'throws' | 'belongs_to' | 'annotated_with';
   source: string;
   target: string;
   source_file: string;

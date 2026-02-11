@@ -1,14 +1,15 @@
 import { ParsedEntity, ParsedRelationship } from '../../../types.js';
+import { AnnotationInfo } from '../../../../types.js';
 import { EntityFactory } from '../../base/EntityFactory.js';
 import { RelationshipBuilder } from '../../base/RelationshipBuilder.js';
 import { JavaContentExtractor } from '../../extractors/java/JavaContentExtractor.js';
 import { JavaDocExtractor } from '../../extractors/java/JavaDocExtractor.js';
-import { JavaFrameworkDetector } from '../../framework-detection/java/JavaFrameworkDetector.js';
+import { JavaAnnotationExtractor } from '../../extractors/java/JavaAnnotationExtractor.js';
 
 export class JavaFieldParser {
   private contentExtractor = new JavaContentExtractor();
   private docExtractor = new JavaDocExtractor();
-  private frameworkDetector = new JavaFrameworkDetector();
+  private annotationExtractor = new JavaAnnotationExtractor();
 
   parseFields(
     content: string, 
@@ -34,8 +35,8 @@ export class JavaFieldParser {
         ? this.docExtractor.extractDocumentation(content, this.getPositionFromLine(content, parsedField.startLine))
         : undefined;
 
-      // Extract annotations
-      const annotations = this.extractAnnotations(content, parsedField.startLine || 1);
+      // Extract annotations using the shared annotation extractor
+      const annotations = this.annotationExtractor.extractAnnotationsForLine(content, parsedField.startLine || 1);
 
       // Create field entity
       const fieldEntity = EntityFactory.createField(
@@ -51,6 +52,11 @@ export class JavaFieldParser {
       );
 
       addEntity(fieldEntity);
+
+      // Create annotation nodes and ANNOTATED_WITH relationships for field
+      this.createAnnotationNodesAndRelationships(
+        fieldId, annotations, filePath, containingClass.qualified_name, addEntity, addRelationship
+      );
 
       // Create containment relationship
       addRelationship(RelationshipBuilder.createContains(containingClass.id, fieldId, filePath));
@@ -209,28 +215,57 @@ export class JavaFieldParser {
     const annotations: any[] = [];
     const lines = content.split('\n');
     
-    // Look backwards from the field declaration for annotations
-    for (let i = startLine - 2; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line || line.startsWith('//') || line.startsWith('/*')) continue;
-      
-      const annotationMatch = line.match(/@([A-Za-z_][A-Za-z0-9_]*)/);
-      if (annotationMatch) {
-        const annotationName = annotationMatch[1];
-        const framework = this.frameworkDetector.detectFramework(annotationName) || 'Unknown';
-        const category = this.frameworkDetector.categorizeAnnotation(annotationName) || 'unknown';
-        
-        annotations.unshift({
-          name: annotationName,
-          framework,
-          category
-        });
-      } else if (line && !line.startsWith('@')) {
-        break; // Stop at non-annotation content
+    // Standard Java library packages - skip references to these
+    const javaStandardPackages = [
+      'java.lang.',
+      'java.util.',
+      'java.io.',
+      'java.math.',
+      'java.time.',
+      'java.net.',
+      'java.nio.',
+      'java.sql.',
+      'java.text.',
+      'java.security.',
+      'java.concurrent.',
+      'java.util.concurrent.',
+      'java.util.function.',
+      'java.util.stream.',
+      'java.util.regex.',
+      'javax.',
+      'jakarta.',
+      'org.w3c.',
+      'org.xml.',
+      'sun.',
+      'com.sun.'
+    ];
+    
+    // Check if type is from a standard Java package
+    for (const pkg of javaStandardPackages) {
+      if (typeName.startsWith(pkg)) {
+        return true;
       }
     }
     
-    return annotations;
+    // Common collection types (unqualified)
+    const commonCollections = [
+      'List', 'Set', 'Map', 'Collection', 'Queue', 'Deque', 
+      'ArrayList', 'LinkedList', 'HashMap', 'HashSet', 'TreeMap', 'TreeSet',
+      'LinkedHashMap', 'LinkedHashSet', 'ConcurrentHashMap', 'ConcurrentMap',
+      'Optional', 'Stream', 'Iterator', 'Iterable', 'Comparable', 'Comparator',
+      'Supplier', 'Consumer', 'Function', 'Predicate', 'BiFunction', 'BiConsumer',
+      'BigDecimal', 'BigInteger', 'Date', 'Calendar', 'LocalDate', 'LocalDateTime',
+      'LocalTime', 'Instant', 'Duration', 'Period', 'ZonedDateTime', 'OffsetDateTime',
+      'UUID', 'URI', 'URL', 'File', 'Path', 'Pattern', 'Matcher',
+      'StringBuilder', 'StringBuffer', 'CharSequence', 'Appendable',
+      'Exception', 'RuntimeException', 'Error', 'Throwable'
+    ];
+    
+    if (commonCollections.includes(baseTypeName)) {
+      return true;
+    }
+    
+    return false;
   }
 
   private getPositionFromLine(content: string, lineNumber: number): number {
@@ -242,5 +277,46 @@ export class JavaFieldParser {
     }
     
     return position;
+  }
+
+  /**
+   * Creates annotation nodes and ANNOTATED_WITH relationships for a field.
+   * Each annotation on the field becomes a separate node in the graph.
+   */
+  private createAnnotationNodesAndRelationships(
+    fieldId: string,
+    annotations: AnnotationInfo[],
+    filePath: string,
+    packageName: string,
+    addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+  ): void {
+    for (const annotation of annotations) {
+      // Create unique annotation node ID based on field and annotation name
+      const annotationId = `${fieldId}@${annotation.name}`;
+      const qualifiedName = `${packageName}.${annotation.name}`;
+
+      // Create annotation node
+      const annotationEntity = EntityFactory.createAnnotation(
+        annotationId,
+        annotation.name,
+        qualifiedName,
+        filePath,
+        annotation.source_line,
+        annotation.framework,
+        annotation.category,
+        annotation.parameters
+      );
+
+      addEntity(annotationEntity);
+
+      // Create ANNOTATED_WITH relationship from field to annotation
+      addRelationship(RelationshipBuilder.createAnnotatedWith(
+        fieldId, 
+        annotationId, 
+        filePath, 
+        { source_line: annotation.source_line }
+      ));
+    }
   }
 }

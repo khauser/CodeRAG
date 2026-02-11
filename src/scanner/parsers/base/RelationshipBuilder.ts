@@ -98,4 +98,20 @@ export class RelationshipBuilder {
       source_file: sourceFile
     };
   }
+
+  static createAnnotatedWith(
+    sourceId: string,
+    targetId: string,
+    sourceFile: string,
+    attributes?: { source_line?: number }
+  ): Omit<ParsedRelationship, 'project_id'> {
+    return {
+      id: `${sourceId}_annotated_with_${targetId}`,
+      type: 'annotated_with',
+      source: sourceId,
+      target: targetId,
+      source_file: sourceFile,
+      attributes
+    };
+  }
 }

@@ -75,12 +75,19 @@ export abstract class BaseContentExtractor {
 
   protected findLineNumber(content: string, searchText: string): number | undefined {
     const lines = content.split('\n');
+    // Use word boundary regex to match whole words only
+    // This prevents matching 'no' in 'PipelineNode' for example
+    const wordBoundaryPattern = new RegExp(`\\b${this.escapeRegExp(searchText)}\\b`);
     for (let i = 0; i < lines.length; i++) {
-      if (lines[i].includes(searchText)) {
+      if (wordBoundaryPattern.test(lines[i])) {
         return i + 1; // Line numbers are 1-based
       }
     }
     return undefined;
+  }
+
+  private escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   protected findLineRange(content: string, startText: string, endPattern: RegExp | string): { start: number; end: number } | undefined {

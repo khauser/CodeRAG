@@ -14,7 +14,7 @@ export interface AnnotationInfo {
 export interface CodeNode {
   id: string;
   project_id: string;
-  type: 'class' | 'interface' | 'enum' | 'exception' | 'function' | 'method' | 'field' | 'package' | 'module';
+  type: 'class' | 'interface' | 'enum' | 'exception' | 'function' | 'method' | 'field' | 'package' | 'module' | 'annotation';
   name: string;
   qualified_name: string;
   description?: string;
@@ -30,6 +30,8 @@ export interface CodeNode {
     }>;
     return_type?: string;
     annotations?: AnnotationInfo[];
+    framework?: string;            // For annotation nodes: the framework (Spring, JUnit, etc.)
+    category?: string;             // For annotation nodes: the category (testing, injection, etc.)
     [key: string]: any;
   };
 }
@@ -37,7 +39,7 @@ export interface CodeNode {
 export interface CodeEdge {
   id: string;
   project_id: string;
-  type: 'calls' | 'implements' | 'extends' | 'contains' | 'references' | 'throws' | 'belongs_to';
+  type: 'calls' | 'implements' | 'extends' | 'contains' | 'references' | 'throws' | 'belongs_to' | 'annotated_with';
   source: string;
   target: string;
   attributes?: {
