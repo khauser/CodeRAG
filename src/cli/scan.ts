@@ -40,9 +40,11 @@ program
   .option('--output-report', 'Generate and save a scan report', false)
   .option('--validate-only', 'Only validate the project structure without scanning', false)
   .option('--branch <branch>', 'Git branch to scan (for remote repositories)', 'main')
-  .option('--no-cleanup', 'Keep temporary files after scanning (for debugging)', false)
+  .option('--no-cleanup', 'Keep temporary files after scanning (for debugging)')
   .option('--use-cache', 'Enable repository caching for faster subsequent scans', false)
   .option('--clear-cache', 'Clear git repository cache before scanning', false)
+  .option('--embeddings', 'Generate embeddings after scan (default: true)', true)
+  .option('--no-embeddings', 'Skip automatic embedding generation after scan')
   .option('-v, --verbose', 'Show detailed progress information', false)
   .action(async (projectPath: string, options) => {
     try {
@@ -285,6 +287,37 @@ program
 
       }
 
+      // Generate embeddings automatically (unless --no-embeddings is specified)
+      if (options.embeddings !== false) {
+        const { getSemanticSearchConfig } = await import('../config.js');
+        const semanticConfig = getSemanticSearchConfig();
+        
+        if (semanticConfig.provider === 'disabled') {
+          console.log(`\n⚠️ Semantic search is disabled. Skipping embedding generation.`);
+          console.log(`   Set SEMANTIC_SEARCH_PROVIDER to 'openai' or 'ollama' to enable.`);
+        } else {
+          console.log(`\n🧠 Generating embeddings...`);
+          console.log(`   Provider: ${semanticConfig.provider} | Model: ${semanticConfig.model}`);
+          
+          try {
+            const { EmbeddingService } = await import('../services/embedding-service.js');
+            const { SemanticSearchManager } = await import('../services/semantic-search-manager.js');
+            
+            const embeddingService = new EmbeddingService();
+            const semanticSearchManager = new SemanticSearchManager(client, embeddingService);
+            
+            const embeddingResult = await semanticSearchManager.updateEmbeddings(projectId);
+            
+            console.log(`   ✅ Embeddings generated: ${embeddingResult.updated} entities`);
+            if (embeddingResult.failed > 0) {
+              console.log(`   ⚠️ Failed: ${embeddingResult.failed} entities`);
+            }
+          } catch (embeddingError) {
+            console.error(`   ❌ Embedding generation failed:`, embeddingError instanceof Error ? embeddingError.message : String(embeddingError));
+            console.log(`   You can retry later with: coderag-scan embeddings -p ${projectId}`);
+          }
+        }
+      }
 
       await client.disconnect();
       console.log(`\n✅ Scan completed successfully!`);
@@ -352,6 +385,87 @@ program
 
     } catch (error) {
       console.error(`❌ Validation failed:`, error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+// Separate command for generating embeddings
+program
+  .command('embeddings')
+  .description(`Generate or update semantic embeddings for code entities
+
+Environment variables for embedding configuration:
+  SEMANTIC_SEARCH_PROVIDER  - 'openai', 'ollama', or 'disabled' (required)
+  OPENAI_API_KEY            - API key for OpenAI
+  OPENAI_BASE_URL           - Custom base URL (e.g., LM Studio: http://localhost:1234/v1)
+  OLLAMA_BASE_URL           - Ollama server URL (default: http://localhost:11434)
+  EMBEDDING_MODEL           - Model name (e.g., 'text-embedding-3-small', 'nomic-embed-text')
+  EMBEDDING_BATCH_SIZE      - Batch size for API calls (default: 200 for OpenAI, 50 for local)
+  EMBEDDING_PARALLEL_REQUESTS - Parallel requests for local providers (default: 10)
+  EMBED_ENTITY_TYPES        - Comma-separated entity types to embed (default: class,interface,method,function,enum)
+  
+Examples:
+  coderag-scan embeddings                           # Update all embeddings
+  coderag-scan embeddings -p my-project             # Update embeddings for specific project
+  coderag-scan embeddings --types class,interface   # Only embed classes and interfaces`)
+  .option('-p, --project-id <id>', 'Project ID to scope the embedding update to')
+  .option('-t, --types <types>', 'Comma-separated list of node types to embed (class,interface,enum,function,method)')
+  .action(async (options) => {
+    try {
+      console.log(`🧠 CodeRAG Embedding Generator`);
+
+      // Check if semantic search is enabled
+      const { getSemanticSearchConfig } = await import('../config.js');
+      const semanticConfig = getSemanticSearchConfig();
+      
+      if (semanticConfig.provider === 'disabled') {
+        console.error(`❌ Semantic search is disabled. Set SEMANTIC_SEARCH_PROVIDER to 'openai' or 'ollama'.`);
+        process.exit(1);
+      }
+
+      console.log(`📡 Provider: ${semanticConfig.provider}`);
+      console.log(`🤖 Model: ${semanticConfig.model}`);
+      console.log(`📦 Batch size: ${semanticConfig.batch_size}`);
+      if (semanticConfig.provider === 'ollama') {
+        console.log(`🔀 Parallel requests: ${semanticConfig.parallel_requests}`);
+      }
+
+      // Initialize Neo4j connection
+      const config = getConfig();
+      const client = new Neo4jClient(config);
+      await client.connect();
+      console.log(`🔗 Connected to Neo4j: ${config.uri}`);
+
+      // Initialize services
+      const { EmbeddingService } = await import('../services/embedding-service.js');
+      const { SemanticSearchManager } = await import('../services/semantic-search-manager.js');
+      
+      const embeddingService = new EmbeddingService();
+      const semanticSearchManager = new SemanticSearchManager(client, embeddingService);
+
+      // Parse node types
+      const nodeTypes = options.types 
+        ? options.types.split(',').map((t: string) => t.trim())
+        : undefined;
+
+      if (nodeTypes) {
+        console.log(`📋 Entity types: ${nodeTypes.join(', ')}`);
+      }
+
+      // Update embeddings
+      const result = await semanticSearchManager.updateEmbeddings(
+        options.projectId,
+        nodeTypes
+      );
+
+      console.log(`\n✅ Embedding generation completed!`);
+      console.log(`   Updated: ${result.updated}`);
+      console.log(`   Failed: ${result.failed}`);
+
+      await client.disconnect();
+
+    } catch (error) {
+      console.error(`❌ Embedding generation failed:`, error instanceof Error ? error.message : String(error));
       process.exit(1);
     }
   });

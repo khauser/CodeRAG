@@ -91,6 +91,10 @@ export interface SemanticSearchConfig {
   max_tokens: number;
   batch_size: number;
   similarity_threshold: number;
+  /** Number of parallel requests for local providers (Ollama/LM Studio). Default: 10 */
+  parallel_requests?: number;
+  /** Entity types to embed. Default: ['class', 'interface', 'method', 'function', 'enum'] */
+  embed_entity_types?: Array<'class' | 'interface' | 'method' | 'function' | 'enum' | 'field'>;
 }
 
 export interface SemanticSearchResult {

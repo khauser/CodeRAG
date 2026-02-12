@@ -96,10 +96,12 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private config: SemanticSearchConfig;
   private baseUrl: string;
+  private parallelRequests: number;
 
   constructor(config: SemanticSearchConfig) {
     this.config = config;
     this.baseUrl = config.base_url || 'http://localhost:11434';
+    this.parallelRequests = config.parallel_requests || 10;
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
@@ -130,19 +132,31 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 
   async generateEmbeddings(texts: string[]): Promise<number[][]> {
     try {
-      const results: number[][] = [];
-      const batchSize = Math.min(this.config.batch_size, texts.length);
+      const results: number[][] = new Array(texts.length);
       
-      // Ollama doesn't support batch embeddings, so we process individually
-      // but in controlled batches to avoid overwhelming the server
-      for (let i = 0; i < texts.length; i += batchSize) {
-        const batch = texts.slice(i, i + batchSize);
-        const batchPromises = batch.map(text => this.generateEmbedding(text));
+      // Process in parallel batches with controlled concurrency
+      // This allows multiple GPU inference requests to queue up
+      for (let i = 0; i < texts.length; i += this.parallelRequests) {
+        const batch = texts.slice(i, i + this.parallelRequests);
+        const batchPromises = batch.map((text, idx) => 
+          this.generateEmbedding(text)
+            .then(embedding => ({ index: i + idx, embedding }))
+            .catch(error => {
+              console.warn(`Failed to generate embedding for text at index ${i + idx}:`, error);
+              return { index: i + idx, embedding: null as number[] | null };
+            })
+        );
+        
         const batchResults = await Promise.all(batchPromises);
-        results.push(...batchResults);
+        for (const result of batchResults) {
+          if (result.embedding) {
+            results[result.index] = result.embedding;
+          }
+        }
       }
 
-      return results;
+      // Filter out any null results and return
+      return results.filter(Boolean);
     } catch (error) {
       throw new Error(`Failed to generate Ollama batch embeddings: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }

@@ -81,6 +81,15 @@ export function getSemanticSearchConfig(): SemanticSearchConfig {
   // Default dimensions based on model and provider
   const defaultDimensions = getDefaultDimensions(model, provider);
 
+  // Parse entity types from environment variable (comma-separated)
+  const embedEntityTypesEnv = process.env.EMBED_ENTITY_TYPES;
+  const embed_entity_types = embedEntityTypesEnv 
+    ? embedEntityTypesEnv.split(',').map(t => t.trim()) as SemanticSearchConfig['embed_entity_types']
+    : undefined;
+
+  // Default batch size depends on provider (OpenAI supports up to 2048, local providers are limited by GPU)
+  const defaultBatchSize = provider === 'openai' ? 200 : 50;
+
   return {
     provider,
     model,
@@ -88,8 +97,10 @@ export function getSemanticSearchConfig(): SemanticSearchConfig {
     base_url,
     dimensions: parseInt(process.env.EMBEDDING_DIMENSIONS || defaultDimensions.toString(), 10),
     max_tokens: parseInt(process.env.EMBEDDING_MAX_TOKENS || '8000', 10),
-    batch_size: parseInt(process.env.EMBEDDING_BATCH_SIZE || '100', 10),
-    similarity_threshold: parseFloat(process.env.SIMILARITY_THRESHOLD || '0.7')
+    batch_size: parseInt(process.env.EMBEDDING_BATCH_SIZE || defaultBatchSize.toString(), 10),
+    similarity_threshold: parseFloat(process.env.SIMILARITY_THRESHOLD || '0.7'),
+    parallel_requests: parseInt(process.env.EMBEDDING_PARALLEL_REQUESTS || '10', 10),
+    embed_entity_types
   };
 }
 

@@ -6,6 +6,7 @@ import { NodeManager } from '../graph/node-manager.js';
 import { EdgeManager } from '../graph/edge-manager.js';
 import { EmbeddingService } from '../services/embedding-service.js';
 import { SemanticSearchManager } from '../services/semantic-search-manager.js';
+import { getSemanticSearchConfig } from '../config.js';
 import { TypeScriptParser } from './parsers/typescript-parser.js';
 import { JavaParser } from './parsers/java-parser.js';
 import { PythonParser } from './parsers/python-parser.js';
@@ -657,9 +658,13 @@ ${errors.length > 10 ? `  ... and ${errors.length - 10} more` : ''}
     let successful = 0;
     let failed = 0;
 
+    // Get config for entity type filtering
+    const semanticConfig = getSemanticSearchConfig();
+    const allowedTypes = semanticConfig.embed_entity_types || ['class', 'interface', 'method', 'function', 'enum'];
+
     // Filter entities that would benefit from embeddings
     const relevantEntities = entities.filter(entity => 
-      ['class', 'interface', 'method', 'function', 'enum'].includes(entity.type) &&
+      allowedTypes.includes(entity.type as any) &&
       (entity.description || entity.name || entity.qualified_name)
     );
 
@@ -667,10 +672,17 @@ ${errors.length > 10 ? `  ... and ${errors.length - 10} more` : ''}
       return { successful: 0, failed: 0 };
     }
 
+    console.log(`📊 Filtering: ${entities.length} total → ${relevantEntities.length} entities to embed (types: ${allowedTypes.join(', ')})`);
+
     // Process in batches to avoid overwhelming the API
-    const batchSize = 50;
+    const batchSize = semanticConfig.batch_size || 50;
+    const totalBatches = Math.ceil(relevantEntities.length / batchSize);
+    const startTime = Date.now();
+    let processedBatches = 0;
+
     for (let i = 0; i < relevantEntities.length; i += batchSize) {
       const batch = relevantEntities.slice(i, i + batchSize);
+      const batchNumber = Math.floor(i / batchSize) + 1;
       
       try {
         // Extract semantic content for the batch
@@ -704,9 +716,35 @@ ${errors.length > 10 ? `  ... and ${errors.length - 10} more` : ''}
         console.warn(`Failed to process embedding batch starting at index ${i}:`, error);
         failed += batch.length;
       }
+
+      processedBatches++;
+      
+      // Show progress with ETA every 10 batches or on last batch
+      if (processedBatches % 10 === 0 || processedBatches === totalBatches) {
+        const elapsedMs = Date.now() - startTime;
+        const avgMsPerBatch = elapsedMs / processedBatches;
+        const remainingBatches = totalBatches - processedBatches;
+        const etaMs = avgMsPerBatch * remainingBatches;
+        const etaStr = this.formatDuration(etaMs);
+        const percent = Math.round((processedBatches / totalBatches) * 100);
+        
+        console.log(`⏳ Progress: ${percent}% (${successful + failed}/${relevantEntities.length}) | ETA: ${etaStr}`);
+      }
     }
 
     return { successful, failed };
+  }
+
+  private formatDuration(ms: number): string {
+    if (ms < 1000) return 'less than 1s';
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
   }
 
   async scanRemoteRepository(

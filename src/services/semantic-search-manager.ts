@@ -265,11 +265,17 @@ export class SemanticSearchManager {
     const result = await this.neo4jClient.runQuery(query, queryParams);
     const nodes = result.records.map(record => this.neo4jRecordToCodeNode(record.get('n')));
 
+    console.log(`🧠 Generating embeddings for ${nodes.length} entities...`);
+
     let updated = 0;
     let failed = 0;
 
     // Process nodes in batches
     const batchSize = this.config.batch_size;
+    const totalBatches = Math.ceil(nodes.length / batchSize);
+    const startTime = Date.now();
+    let processedBatches = 0;
+
     for (let i = 0; i < nodes.length; i += batchSize) {
       const batch = nodes.slice(i, i + batchSize);
       
@@ -301,9 +307,36 @@ export class SemanticSearchManager {
         console.error(`Failed to process batch starting at index ${i}:`, error);
         failed += batch.length;
       }
+
+      processedBatches++;
+      
+      // Show progress with ETA every 10 batches or on last batch
+      if (processedBatches % 10 === 0 || processedBatches === totalBatches) {
+        const elapsedMs = Date.now() - startTime;
+        const avgMsPerBatch = elapsedMs / processedBatches;
+        const remainingBatches = totalBatches - processedBatches;
+        const etaMs = avgMsPerBatch * remainingBatches;
+        const etaStr = this.formatDuration(etaMs);
+        const percent = Math.round((processedBatches / totalBatches) * 100);
+        
+        console.log(`⏳ Progress: ${percent}% (${updated + failed}/${nodes.length}) | ETA: ${etaStr}`);
+      }
     }
 
+    console.log(`✅ Embedding update completed. Updated: ${updated}, Failed: ${failed}`);
     return { updated, failed };
+  }
+
+  private formatDuration(ms: number): string {
+    if (ms < 1000) return 'less than 1s';
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
   }
 
   private neo4jRecordToCodeNode(record: any): CodeNode {
