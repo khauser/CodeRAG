@@ -59,7 +59,8 @@ describe('CodebaseScanner', () => {
       await scanner.clearGraph();
 
       expect(mockClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('MATCH (n)')
+        expect.stringContaining('MATCH (n)'),
+        expect.any(Object)
       );
     });
   });

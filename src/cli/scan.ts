@@ -43,7 +43,6 @@ program
   .option('--no-cleanup', 'Keep temporary files after scanning (for debugging)')
   .option('--use-cache', 'Enable repository caching for faster subsequent scans', false)
   .option('--clear-cache', 'Clear git repository cache before scanning', false)
-  .option('--embeddings', 'Generate embeddings after scan (default: true)', true)
   .option('--no-embeddings', 'Skip automatic embedding generation after scan')
   .option('-v, --verbose', 'Show detailed progress information', false)
   .action(async (projectPath: string, options) => {

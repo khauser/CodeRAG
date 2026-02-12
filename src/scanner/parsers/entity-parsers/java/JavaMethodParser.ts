@@ -248,7 +248,27 @@ export class JavaMethodParser {
     const annotations: any[] = [];
     const lines = content.split('\n');
     
-    return commonAnnotations.includes(name);
+    // Look backwards from the method declaration for annotations
+    for (let i = startLine - 2; i >= 0 && i >= startLine - 10; i--) {
+      const line = lines[i]?.trim() || '';
+      
+      // Stop if we hit a non-annotation line (but skip blank lines)
+      if (!line.startsWith('@') && line.length > 0 && !line.startsWith('//') && !line.startsWith('*')) {
+        break;
+      }
+      
+      // Extract annotation
+      const annotationMatch = line.match(/@(\w+)(?:\((.*)\))?/);
+      if (annotationMatch) {
+        annotations.push({
+          name: annotationMatch[1],
+          parameters: annotationMatch[2] || null,
+          source_line: i + 1
+        });
+      }
+    }
+    
+    return annotations;
   }
 
   private getPositionFromLine(content: string, lineNumber: number): number {

@@ -215,57 +215,27 @@ export class JavaFieldParser {
     const annotations: any[] = [];
     const lines = content.split('\n');
     
-    // Standard Java library packages - skip references to these
-    const javaStandardPackages = [
-      'java.lang.',
-      'java.util.',
-      'java.io.',
-      'java.math.',
-      'java.time.',
-      'java.net.',
-      'java.nio.',
-      'java.sql.',
-      'java.text.',
-      'java.security.',
-      'java.concurrent.',
-      'java.util.concurrent.',
-      'java.util.function.',
-      'java.util.stream.',
-      'java.util.regex.',
-      'javax.',
-      'jakarta.',
-      'org.w3c.',
-      'org.xml.',
-      'sun.',
-      'com.sun.'
-    ];
-    
-    // Check if type is from a standard Java package
-    for (const pkg of javaStandardPackages) {
-      if (typeName.startsWith(pkg)) {
-        return true;
+    // Look backwards from the field declaration for annotations
+    for (let i = startLine - 2; i >= 0 && i >= startLine - 10; i--) {
+      const line = lines[i]?.trim() || '';
+      
+      // Stop if we hit a non-annotation line (but skip blank lines)
+      if (!line.startsWith('@') && line.length > 0 && !line.startsWith('//') && !line.startsWith('*')) {
+        break;
+      }
+      
+      // Extract annotation
+      const annotationMatch = line.match(/@(\w+)(?:\((.*)\))?/);
+      if (annotationMatch) {
+        annotations.push({
+          name: annotationMatch[1],
+          parameters: annotationMatch[2] || null,
+          source_line: i + 1
+        });
       }
     }
     
-    // Common collection types (unqualified)
-    const commonCollections = [
-      'List', 'Set', 'Map', 'Collection', 'Queue', 'Deque', 
-      'ArrayList', 'LinkedList', 'HashMap', 'HashSet', 'TreeMap', 'TreeSet',
-      'LinkedHashMap', 'LinkedHashSet', 'ConcurrentHashMap', 'ConcurrentMap',
-      'Optional', 'Stream', 'Iterator', 'Iterable', 'Comparable', 'Comparator',
-      'Supplier', 'Consumer', 'Function', 'Predicate', 'BiFunction', 'BiConsumer',
-      'BigDecimal', 'BigInteger', 'Date', 'Calendar', 'LocalDate', 'LocalDateTime',
-      'LocalTime', 'Instant', 'Duration', 'Period', 'ZonedDateTime', 'OffsetDateTime',
-      'UUID', 'URI', 'URL', 'File', 'Path', 'Pattern', 'Matcher',
-      'StringBuilder', 'StringBuffer', 'CharSequence', 'Appendable',
-      'Exception', 'RuntimeException', 'Error', 'Throwable'
-    ];
-    
-    if (commonCollections.includes(baseTypeName)) {
-      return true;
-    }
-    
-    return false;
+    return annotations;
   }
 
   private getPositionFromLine(content: string, lineNumber: number): number {

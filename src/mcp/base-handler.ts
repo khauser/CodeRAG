@@ -115,6 +115,13 @@ export abstract class BaseHandler {
             return await this.handleDeleteNode(request.params.arguments);
           case 'find_nodes_by_type':
             return await this.handleFindNodesByType(request.params.arguments);
+          case 'lookup_class':
+            // Alias for search_nodes - converts class_name to search_term
+            return await this.handleSearchNodes({
+              project: request.params.arguments?.project,
+              search_term: request.params.arguments?.class_name,
+              limit: 10
+            });
           case 'search_nodes':
             return await this.handleSearchNodes(request.params.arguments);
           case 'add_edge':
@@ -296,7 +303,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'get_node',
-        description: 'Get a code node by ID',
+        description: 'Get detailed information about a specific code entity by its unique ID. Use this after search_nodes to get full details about a class, method, or other entity.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -320,7 +327,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'find_nodes_by_type',
-        description: 'Find nodes by their type',
+        description: 'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -345,13 +352,25 @@ export abstract class BaseHandler {
         }
       },
       {
+        name: 'lookup_class',
+        description: 'PRIMARY TOOL for questions about a specific class by name. Use this when the user asks about a class like "tell me about class X", "what is class X", "explain class X", "Was kannst du mir über Klasse X sagen", "Was ist die Klasse X". This is the correct tool for class name lookups - NOT semantic_search.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            project: { type: 'string', description: 'Project name or identifier' },
+            class_name: { type: 'string', description: 'The exact class name from the user query (e.g., "IsApprovalNeeded", "UserService", "PaymentProcessor")' }
+          },
+          required: ['project', 'class_name']
+        }
+      },
+      {
         name: 'search_nodes',
-        description: 'Search nodes by name, qualified name, or description',
+        description: 'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. For class lookups, prefer lookup_class. Examples: "find method validate", "search for interface Repository".',
         inputSchema: {
           type: 'object',
           properties: {
             project: { type: 'string', description: 'Project name or identifier to scope the operation to' },
-            search_term: { type: 'string', description: 'Search term' },
+            search_term: { type: 'string', description: 'Name or part of the name of the class, method, interface, or code entity to search for' },
             limit: {
               type: 'number',
               description: 'Maximum number of results to return',
@@ -831,13 +850,13 @@ export abstract class BaseHandler {
       },
       {
         name: 'semantic_search',
-        description: 'Search for code using natural language queries to find functionality by meaning rather than syntax',
+        description: 'ONLY for searching code by what it DOES, not by name. Use ONLY when searching for functionality like "functions that validate email" or "authentication logic". DO NOT use for questions about specific classes or methods by name - for those use lookup_class or search_nodes instead. Example: "find code that handles payments" = use semantic_search. "tell me about class PaymentService" = use lookup_class.',
         inputSchema: {
           type: 'object',
           properties: {
             query: { 
               type: 'string', 
-              description: 'Natural language description of the functionality to search for (e.g., "functions that validate email addresses")' 
+              description: 'Describe the functionality you are looking for (NOT a class/method name). Example: "code that validates user input"' 
             },
             project_id: { 
               type: 'string', 
