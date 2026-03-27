@@ -1,3 +1,4 @@
+import neo4j from 'neo4j-driver';
 import { Neo4jClient } from '../graph/neo4j-client.js';
 import { EmbeddingService } from './embedding-service.js';
 import { CodeNode, SemanticSearchParams, SemanticSearchResult, SemanticEmbedding } from '../types.js';
@@ -81,7 +82,7 @@ export class SemanticSearchManager {
     }
 
     // Build the search query
-    const limit = params.limit || 10;
+    const limit = neo4j.int(Math.floor(params.limit || 10));
     const threshold = params.similarity_threshold || this.config.similarity_threshold;
     
     let whereClause = 'n.semantic_embedding IS NOT NULL';
@@ -187,6 +188,7 @@ export class SemanticSearchManager {
   }
 
   async getSimilarNodes(nodeId: string, projectId: string, limit: number = 5): Promise<SemanticSearchResult[]> {
+    const limitInt = neo4j.int(Math.floor(limit));
     // Get the embedding of the target node
     const nodeQuery = `
       MATCH (n:CodeNode {id: $nodeId, project_id: $projectId})
@@ -221,7 +223,7 @@ export class SemanticSearchManager {
       nodeId,
       targetEmbedding,
       threshold: this.config.similarity_threshold,
-      limit
+      limit: limitInt
     });
 
     return result.records.map(record => {

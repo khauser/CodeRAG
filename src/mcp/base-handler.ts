@@ -327,7 +327,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'find_nodes_by_type',
-        description: 'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name.',
+        description: 'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name. Nodes have an is_abstract boolean property — to list only abstract classes use type=class and filter results by is_abstract=true.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -432,7 +432,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'find_edges_by_source',
-        description: 'Find all edges originating from a source node',
+        description: 'Find all outgoing relationships from a node. Edge types in this graph: calls (method→method), implements (class→interface), extends (class→class or interface→interface), contains (class→method/field), references (class→class), throws (method→exception), belongs_to (method→class), annotated_with (class/method→annotation). Use this to explore what a class depends on or calls.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -478,7 +478,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'find_classes_implementing_interface',
-        description: 'Find all classes that implement a specific interface',
+        description: 'Find all classes that implement an interface OR extend an abstract class. Searches both IMPLEMENTS and EXTENDS edges, and uses the is_abstract flag to correctly handle abstract class hierarchies. Works with simple name or fully qualified name.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -501,7 +501,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'get_inheritance_hierarchy',
-        description: 'Get the inheritance hierarchy for a class',
+        description: 'Get the full ancestor chain for a class by traversing EXTENDS edges upward (child → parent → grandparent). Returns all superclasses up to the root. Use this to understand where a class sits in the inheritance tree or which base class behavior it inherits.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -513,7 +513,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'calculate_ck_metrics',
-        description: 'Calculate Chidamber & Kemerer metrics for a class (WMC, DIT, NOC, CBO, RFC, LCOM)',
+        description: 'Calculate Chidamber & Kemerer object-oriented quality metrics for a class: WMC (Weighted Methods per Class — complexity), DIT (Depth of Inheritance Tree — how deep in hierarchy), NOC (Number of Children — direct subclasses), CBO (Coupling Between Objects — how many other classes it depends on), RFC (Response For a Class — reachable methods), LCOM (Lack of Cohesion — how unrelated the methods are). High CBO/WMC/RFC = risky to change. High DIT = fragile inheritance.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -850,7 +850,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'semantic_search',
-        description: 'ONLY for searching code by what it DOES, not by name. Use ONLY when searching for functionality like "functions that validate email" or "authentication logic". DO NOT use for questions about specific classes or methods by name - for those use lookup_class or search_nodes instead. Example: "find code that handles payments" = use semantic_search. "tell me about class PaymentService" = use lookup_class.',
+        description: 'Search code by FUNCTIONALITY using vector embeddings stored in Neo4j — use when you don\'t know the exact name. Ideal for: cross-cutting concerns ("where is caching done?"), design patterns ("find factory implementations"), business logic ("code that calculates pricing"), or when a name search returns nothing useful. Set include_graph_context=true to also retrieve related classes/methods via graph traversal (up to max_hops hops) for richer context. Lower similarity_threshold (e.g. 0.5) = broader results. DO NOT use for specific known names — use lookup_class or search_nodes instead. Example: "authentication logic" → semantic_search. "class AuthService" → lookup_class.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -924,7 +924,7 @@ export abstract class BaseHandler {
       },
       {
         name: 'get_similar_code',
-        description: 'Find code entities that are semantically similar to a specific node',
+        description: 'Find code entities whose embedding vector is closest to a given node — useful for finding duplicate logic, parallel implementations of the same pattern, or candidate classes to refactor together. Requires the node to have an embedding (run update_embeddings first if needed). Use get_node first to get the node_id.',
         inputSchema: {
           type: 'object',
           properties: {

@@ -9,6 +9,8 @@ import { Neo4jClient } from '../graph/neo4j-client.js';
 import { NodeManager } from '../graph/node-manager.js';
 import { EdgeManager } from '../graph/edge-manager.js';
 import { MetricsManager } from '../analysis/metrics-manager.js';
+import { SemanticSearchManager } from '../services/semantic-search-manager.js';
+import { EmbeddingService } from '../services/embedding-service.js';
 
 export class HTTPHandler {
   private app: express.Application;
@@ -19,6 +21,7 @@ export class HTTPHandler {
   private nodeManager: NodeManager;
   private edgeManager: EdgeManager;
   private metricsManager: MetricsManager;
+  private semanticSearchManager: SemanticSearchManager;
 
 
   private setupMiddleware(): void {
@@ -59,6 +62,8 @@ export class HTTPHandler {
     this.nodeManager = new NodeManager(client);
     this.edgeManager = new EdgeManager(client);
     this.metricsManager = new MetricsManager(client);
+    const embeddingService = new EmbeddingService();
+    this.semanticSearchManager = new SemanticSearchManager(client, embeddingService);
     
     // Create server once with all tools and prompts
     this.server = this.createServer();
@@ -608,6 +613,42 @@ export class HTTPHandler {
             text: JSON.stringify(result, null, 2)
           }]
         };
+      }
+    );
+
+    // Tool: Semantic search
+    server.tool(
+      'semantic_search',
+      'Search for code nodes using natural language via vector embeddings. Use this when you do not know the exact class or method name but can describe what the code does (e.g. "checks if approval is needed", "sends email notifications"). Returns semantically similar classes, methods, interfaces, etc. with similarity scores (0.0–1.0). Requires embeddings to be generated first (update_embeddings).',
+      {
+        query: z.string().describe('Natural language description of what the code does, e.g. "checks if approval is needed for a business object"'),
+        project_id: z.string().optional().describe('Project identifier from list_projects. Omit to search across all projects.'),
+        node_types: z.array(z.enum(['class', 'interface', 'enum', 'exception', 'method', 'function', 'field', 'package', 'module'])).optional().describe('Filter results to specific node types. Omit to search all types.'),
+        limit: z.number().int().min(1).max(100).optional().describe('Maximum number of results to return. Default: 10.'),
+        similarity_threshold: z.number().min(0).max(1).optional().describe('Minimum similarity score (0.0–1.0). Higher = stricter match. Default: ~0.7.'),
+        include_graph_context: z.boolean().optional().describe('If true, enriches results with related nodes via graph traversal (hybrid search). Useful to understand surrounding context.'),
+        max_hops: z.number().int().min(1).max(5).optional().describe('Graph traversal depth when include_graph_context is true. Default: 2.')
+      },
+      async (args) => {
+        const { semanticSearch } = await import('./tools/semantic-search.js');
+        const result = await semanticSearch(this.semanticSearchManager, args);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+    );
+
+    // Tool: Get similar code
+    server.tool(
+      'get_similar_code',
+      'Find code nodes whose embedding vector is closest to a given node — useful for finding duplicate logic, parallel implementations, or refactoring candidates. Requires the node to have an embedding (run update_embeddings first). Use get_node or search_nodes first to obtain the node_id.',
+      {
+        node_id: z.string().describe('The ID of the reference node to find similar code for. Use get_node or search_nodes to obtain this.'),
+        project_id: z.string().describe('Project identifier from list_projects.'),
+        limit: z.number().int().min(1).max(100).optional().describe('Maximum number of similar nodes to return. Default: 5.')
+      },
+      async (args) => {
+        const { getSimilarCode } = await import('./tools/semantic-search.js');
+        const result = await getSimilarCode(this.semanticSearchManager, args);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
     );
 

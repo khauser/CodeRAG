@@ -277,11 +277,11 @@ export class EdgeManager {
 
   async findClassesThatImplementInterface(interfaceName: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:IMPLEMENTS {project_id: $project_id}]->
-      (interface:CodeNode {type: 'interface', project_id: $project_id})
-      WHERE interface.name = $interfaceName
-         OR interface.qualified_name = $interfaceName
-         OR interface.id = $interfaceName
+      MATCH (target:CodeNode {project_id: $project_id})
+      WHERE (target.name = $interfaceName OR target.qualified_name = $interfaceName OR target.id = $interfaceName)
+        AND target.type IN ['interface', 'class']
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[r:IMPLEMENTS|EXTENDS {project_id: $project_id}]->(target)
+      WHERE target.type = 'interface' OR target.is_abstract = true
       RETURN class.name as className, class.qualified_name as qualifiedName
       ORDER BY className
     `;
