@@ -61,6 +61,17 @@ export class JavaMethodParser {
       // Create containment relationship
       addRelationship(RelationshipBuilder.createContains(containingClass.id, methodId, filePath));
 
+      // Create throws relationships for declared exceptions
+      if (parsedMethod.throws && parsedMethod.throws.length > 0) {
+        const containingPackage = containingClass.qualified_name.substring(0, containingClass.qualified_name.lastIndexOf('.'));
+        for (const exceptionName of parsedMethod.throws) {
+          const resolvedExc = this.resolveClassName(exceptionName, containingPackage, extractionResult.imports);
+          if (resolvedExc && !this.isStandardLibraryType(resolvedExc)) {
+            addRelationship(RelationshipBuilder.createThrows(methodId, resolvedExc, filePath));
+          }
+        }
+      }
+
       // Parse method calls and create call relationships
       // Pass the containing class qualified name for proper internal method resolution
       this.parseMethodCalls(content, parsedMethod, methodId, containingClass.qualified_name, extractionResult.imports, addRelationship, filePath, entities);

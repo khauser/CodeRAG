@@ -18,6 +18,8 @@ export interface ScanConfig {
     maxAge?: number;
     forceRefresh?: boolean;
   };
+  // Embedding options
+  skipEmbeddings?: boolean;
 }
 
 export type Language = 'typescript' | 'javascript' | 'java' | 'python' | 'csharp';
@@ -33,6 +35,7 @@ export interface ParsedEntity {
   start_line?: number;
   end_line?: number;
   modifiers?: string[];
+  is_abstract?: boolean;
   annotations?: any[];
   attributes?: {
     parameters?: Array<{

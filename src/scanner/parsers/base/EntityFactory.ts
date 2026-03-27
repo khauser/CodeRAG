@@ -22,6 +22,7 @@ export class EntityFactory {
       start_line: startLine,
       end_line: endLine,
       modifiers: modifiers || [],
+      is_abstract: (modifiers || []).includes('abstract'),
       description,
       annotations: annotations || []
     };

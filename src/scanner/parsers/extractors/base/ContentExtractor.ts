@@ -6,6 +6,7 @@ export interface ParsedMethod {
   startLine?: number;
   endLine?: number;
   body?: string;
+  throws?: string[];
 }
 
 export interface ParsedParameter {

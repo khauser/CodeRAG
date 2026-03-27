@@ -14,8 +14,8 @@ import {
 export class JavaContentExtractor extends BaseContentExtractor {
   private static readonly PACKAGE_PATTERN = /^\s*package\s+([a-zA-Z_$][a-zA-Z0-9_$.]*)\s*;/m;
   private static readonly IMPORT_PATTERN = /^\s*import\s+(?:static\s+)?([a-zA-Z_$][a-zA-Z0-9_$.]*(?:\.\*)?);/gm;
-  private static readonly CLASS_PATTERN = /(?:(?:public|private|protected|static|final|abstract)\s+)*class\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:extends\s+([^{]+?))?\s*(?:implements\s+([^{]+?))?\s*\{/g;
-  private static readonly INTERFACE_PATTERN = /(?:(?:public|private|protected|static)\s+)*interface\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:extends\s+([^{]+?))?\s*\{/g;
+  private static readonly CLASS_PATTERN = /(?:(?:public|private|protected|static|final|abstract)\s+)*class\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^{]*>)?\s*(?:extends\s+([^{]+?))?\s*(?:implements\s+([^{]+?))?\s*\{/g;
+  private static readonly INTERFACE_PATTERN = /(?:(?:public|private|protected|static)\s+)*interface\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^{]*>)?\s*(?:extends\s+([^{]+?))?\s*\{/g;
   private static readonly ENUM_PATTERN = /(?:(?:public|private|protected|static)\s+)*enum\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\{([^}]+)\}/g;
   // Method pattern that properly handles annotations before method signatures
   private static readonly METHOD_PATTERN = /(?:@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?\s*)*(?:(?:public|private|protected|static|final|abstract|synchronized|native|strictfp)\s+)*(?:(<[^>]+>\s+))?([A-Za-z_$][A-Za-z0-9_$.<>,\[\]]*)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*(?:throws\s+([^{]+?))?\s*[{;]/g;
@@ -193,14 +193,20 @@ export class JavaContentExtractor extends BaseContentExtractor {
       const [fullMatch, genericTypes, returnType, methodName, paramString, throwsClause] = match;
       const lineNumber = this.findLineNumber(content, methodName);
       
-      methods.push({
+      const parsedMethod: any = {
         name: methodName,
         parameters: this.parseParameters(paramString || ''),
         returnType: returnType?.trim(),
         modifiers: this.extractModifiersFromMatch(fullMatch),
         startLine: lineNumber,
         endLine: lineNumber
-      });
+      };
+
+      if (throwsClause) {
+        parsedMethod.throws = throwsClause.split(',').map((t: string) => t.trim()).filter((t: string) => t.length > 0);
+      }
+
+      methods.push(parsedMethod);
     }
 
     return methods;

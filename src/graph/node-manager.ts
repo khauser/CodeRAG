@@ -21,11 +21,13 @@ export class NodeManager {
         start_line: $start_line,
         end_line: $end_line,
         modifiers: $modifiers,
+        is_abstract: $is_abstract,
         attributes_json: $attributes_json
       })
       RETURN n
     `;
 
+    const modifiers: string[] = node.modifiers || [];
     const params = {
       id: node.id,
       project_id: node.project_id,
@@ -36,7 +38,8 @@ export class NodeManager {
       source_file: node.source_file || null,
       start_line: node.start_line || null,
       end_line: node.end_line || null,
-      modifiers: this.ensurePlainObject(node.modifiers || []),
+      modifiers: this.ensurePlainObject(modifiers),
+      is_abstract: node.is_abstract ?? modifiers.includes('abstract'),
       attributes_json: JSON.stringify(node.attributes || {})
     };
 
@@ -188,6 +191,7 @@ export class NodeManager {
       start_line: typeof properties.start_line?.toNumber === 'function' ? properties.start_line.toNumber() : properties.start_line,
       end_line: typeof properties.end_line?.toNumber === 'function' ? properties.end_line.toNumber() : properties.end_line,
       modifiers: properties.modifiers || [],
+      is_abstract: properties.is_abstract ?? false,
       attributes: properties.attributes_json ? JSON.parse(properties.attributes_json) : {}
     };
   }

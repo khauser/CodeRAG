@@ -69,8 +69,7 @@ export class JavaFieldParser {
           // Create reference if it's not a primitive/standard library type
           if (!this.isBuiltInType(referencedType)) {
             addRelationship(RelationshipBuilder.createReferences(fieldId, referencedType, filePath));
-            // Also link the containing class to the field type for higher-level graph views.
-            addRelationship(RelationshipBuilder.createReferences(containingClass.id, referencedType, filePath));
+            // Note: class-level references are already created by JavaClassParser.createClassTypeReferences()
           }
         }
       }

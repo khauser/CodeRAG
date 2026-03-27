@@ -22,6 +22,7 @@ export interface CodeNode {
   start_line?: number;
   end_line?: number;
   modifiers?: string[];
+  is_abstract?: boolean;
   attributes?: {
     parameters?: Array<{
       name: string;

@@ -6,7 +6,7 @@ export class EdgeManager {
 
   async addEdge(edge: CodeEdge): Promise<CodeEdge> {
     let query = `
-      MATCH (source:CodeNode {id: $source, project_id: $project_id}), 
+      MATCH (source:CodeNode {id: $source, project_id: $project_id}),
             (target:CodeNode {id: $target, project_id: $project_id})
       CREATE (source)-[r:${edge.type.toUpperCase()} {
         id: $id,
@@ -31,27 +31,7 @@ export class EdgeManager {
     // If the exact target isn't found and this is an implements relationship,
     // try to find the interface by name within the same project
     if (result.records.length === 0 && edge.type === 'implements') {
-      const targetName = edge.target.split('.').pop(); // Get just the interface name
-      
-      const findInterfaceQuery = `
-        MATCH (source:CodeNode {id: $source, project_id: $project_id}), 
-              (target:Interface {project_id: $project_id})
-        WHERE target.name = $targetName
-        CREATE (source)-[r:${edge.type.toUpperCase()} {
-          id: $id,
-          project_id: $project_id,
-          type: $type,
-          attributes_json: $attributes_json
-        }]->(target)
-        RETURN r, source.id as sourceId, target.id as targetId
-      `;
-      
-      const findParams = {
-        ...params,
-        targetName
-      };
-      
-      result = await this.client.runQuery(findInterfaceQuery, this.ensurePlainObject(findParams));
+      result = await this.addEdgeFuzzyImplements(edge, params);
     }
 
     if (result.records.length === 0) {
@@ -59,6 +39,117 @@ export class EdgeManager {
     }
 
     return this.recordToEdge(result.records[0]);
+  }
+
+  /**
+   * Batch-inserts edges grouped by type using UNWIND for high throughput.
+   * All edges of the same type are sent in a single Cypher query instead of
+   * individual round-trips, reducing N queries to ceil(N/batchSize) * numTypes.
+   *
+   * Returns the number of successfully stored edges and an array of errors.
+   */
+  async addEdgesBatch(
+    edges: CodeEdge[],
+    batchSize = 500
+  ): Promise<{ stored: number; errors: Array<{ edge: CodeEdge; error: string }> }> {
+    if (edges.length === 0) return { stored: 0, errors: [] };
+
+    // Group edges by relationship type (Cypher requires a static type token)
+    const byType = new Map<string, CodeEdge[]>();
+    for (const edge of edges) {
+      const t = edge.type.toUpperCase();
+      if (!byType.has(t)) byType.set(t, []);
+      byType.get(t)!.push(edge);
+    }
+
+    let totalStored = 0;
+    const errors: Array<{ edge: CodeEdge; error: string }> = [];
+
+    for (const [type, typeEdges] of byType) {
+      for (let i = 0; i < typeEdges.length; i += batchSize) {
+        const batch = typeEdges.slice(i, i + batchSize);
+        const project_id = batch[0].project_id;
+
+        const rows = batch.map(e => ({
+          id: e.id,
+          type: e.type,
+          source: e.source,
+          target: e.target,
+          attributes_json: JSON.stringify(e.attributes || {})
+        }));
+
+        // UNWIND lets Neo4j process the whole batch in one transaction.
+        // If a MATCH fails (nodes not found), that row is simply skipped —
+        // we detect missing rows by comparing returned IDs against input.
+        const query = `
+          UNWIND $rows AS row
+          MATCH (source:CodeNode {id: row.source, project_id: $project_id}),
+                (target:CodeNode {id: row.target, project_id: $project_id})
+          CREATE (source)-[r:${type} {
+            id: row.id,
+            project_id: $project_id,
+            type: row.type,
+            attributes_json: row.attributes_json
+          }]->(target)
+          RETURN row.id AS id
+        `;
+
+        try {
+          const result = await this.client.runQuery(
+            query,
+            this.ensurePlainObject({ rows, project_id })
+          );
+          const storedIds = new Set<string>(result.records.map((r: any) => r.get('id')));
+          totalStored += storedIds.size;
+
+          // For implements, try fuzzy fallback for edges not created
+          if (type === 'IMPLEMENTS') {
+            for (const edge of batch) {
+              if (!storedIds.has(edge.id)) {
+                try {
+                  const params = {
+                    id: edge.id,
+                    project_id: edge.project_id,
+                    type: edge.type,
+                    source: edge.source,
+                    target: edge.target,
+                    attributes_json: JSON.stringify(edge.attributes || {})
+                  };
+                  const fuzzyResult = await this.addEdgeFuzzyImplements(edge, params);
+                  if (fuzzyResult.records.length > 0) totalStored++;
+                } catch {
+                  // silently skip — interface not in project scope
+                }
+              }
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          for (const edge of batch) {
+            errors.push({ edge, error: message });
+          }
+        }
+      }
+    }
+
+    return { stored: totalStored, errors };
+  }
+
+  private async addEdgeFuzzyImplements(edge: CodeEdge, params: Record<string, any>) {
+    const targetName = edge.target.split('.').pop();
+    const query = `
+      MATCH (source:CodeNode {id: $source, project_id: $project_id}),
+            (target:Interface {project_id: $project_id})
+      WHERE target.name = $targetName
+      CREATE (source)-[r:IMPLEMENTS {
+        id: $id,
+        project_id: $project_id,
+        type: $type,
+        attributes_json: $attributes_json
+      }]->(target)
+      RETURN r, source.id as sourceId, target.id as targetId
+    `;
+    return this.client.runQuery(query, this.ensurePlainObject({ ...params, targetName }));
   }
 
   async updateEdge(edgeId: string, projectId: string, updates: Partial<CodeEdge>): Promise<CodeEdge> {
@@ -187,13 +278,16 @@ export class EdgeManager {
   async findClassesThatImplementInterface(interfaceName: string, projectId: string): Promise<string[]> {
     const query = `
       MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:IMPLEMENTS {project_id: $project_id}]->
-      (interface:CodeNode {type: 'interface', name: $interfaceName, project_id: $project_id})
-      RETURN class.name as className
+      (interface:CodeNode {type: 'interface', project_id: $project_id})
+      WHERE interface.name = $interfaceName
+         OR interface.qualified_name = $interfaceName
+         OR interface.id = $interfaceName
+      RETURN class.name as className, class.qualified_name as qualifiedName
       ORDER BY className
     `;
-    
+
     const result = await this.client.runQuery(query, { interfaceName, project_id: projectId });
-    return result.records.map(record => record.get('className'));
+    return result.records.map(record => record.get('qualifiedName') ?? record.get('className'));
   }
 
   async findInheritanceHierarchy(className: string, projectId: string): Promise<string[]> {

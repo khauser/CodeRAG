@@ -54,9 +54,8 @@ export class JavaClassParser {
         classId, annotations, filePath, packageName, addEntity, addRelationship
       );
 
-      // Create package relationships (bidirectional for better graph traversal)
+      // Create package containment relationship
       const packageId = packageName;
-      addRelationship(RelationshipBuilder.createBelongsTo(classId, packageId, filePath));
       addRelationship(RelationshipBuilder.createContains(packageId, classId, filePath));
 
       // Handle inheritance

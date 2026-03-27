@@ -126,7 +126,7 @@ export class CodebaseScanner {
 
       // Store entities and relationships in the graph
       console.log(`💾 Storing ${allEntities.length} entities and ${allRelationships.length} relationships...`);
-      const storeErrors = await this.storeInGraph(allEntities, allRelationships);
+      const storeErrors = await this.storeInGraph(allEntities, allRelationships, actualConfig.skipEmbeddings);
       allErrors.push(...storeErrors);
 
       const processingTimeMs = Date.now() - startTime;
@@ -171,50 +171,69 @@ export class CodebaseScanner {
   }
 
   async clearGraph(projectId?: string): Promise<void> {
+    const BATCH_SIZE = 500;
+
+    const deleteBatched = async (
+      relQuery: string,
+      nodeQuery: string,
+      params: Record<string, unknown>,
+      label: string
+    ): Promise<void> => {
+      // Phase 1: delete relationships in batches
+      let relCount = 0;
+      let batchCount = 0;
+      do {
+        const result = await this.client.runQuery(relQuery, params);
+        relCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
+        batchCount++;
+        if (relCount > 0) {
+          console.log(`   Rel batch ${batchCount}: deleted ${relCount} relationships...`);
+        }
+      } while (relCount > 0);
+
+      // Phase 2: delete nodes in batches (no relationships remain, so DELETE is safe)
+      let nodeCount = 0;
+      batchCount = 0;
+      do {
+        const result = await this.client.runQuery(nodeQuery, params);
+        nodeCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
+        batchCount++;
+        if (nodeCount > 0) {
+          console.log(`   Node batch ${batchCount}: deleted ${nodeCount} nodes...`);
+        }
+      } while (nodeCount > 0);
+
+      console.log(`✅ ${label} graph data cleared`);
+    };
+
     if (projectId) {
       console.log(`🗑️  Clearing graph data for project '${projectId}'...`);
-      // Delete in batches to avoid transaction memory limit
-      let deletedCount = 0;
-      let batchCount = 0;
-      
-      do {
-        const result = await this.client.runQuery(`
-          MATCH (n:CodeNode {project_id: $project_id})
-          WITH n LIMIT 10000
-          DETACH DELETE n
-          RETURN count(*) as deleted
-        `, { project_id: projectId });
-        
-        deletedCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
-        batchCount++;
-        if (deletedCount > 0) {
-          console.log(`   Batch ${batchCount}: deleted ${deletedCount} nodes...`);
-        }
-      } while (deletedCount > 0);
-      
-      console.log(`✅ Project '${projectId}' graph data cleared`);
+      await deleteBatched(
+        `MATCH (n:CodeNode {project_id: $project_id})-[r]-()
+         WITH r LIMIT ${BATCH_SIZE}
+         DELETE r
+         RETURN count(*) as deleted`,
+        `MATCH (n:CodeNode {project_id: $project_id})
+         WITH n LIMIT ${BATCH_SIZE}
+         DELETE n
+         RETURN count(*) as deleted`,
+        { project_id: projectId },
+        `Project '${projectId}'`
+      );
     } else {
       console.log(`🗑️  Clearing all graph data...`);
-      // Delete in batches to avoid transaction memory limit
-      let deletedCount = 0;
-      let batchCount = 0;
-      
-      do {
-        const result = await this.client.runQuery(`
-          MATCH (n)
-          WITH n LIMIT 10000
-          DETACH DELETE n
-          RETURN count(*) as deleted
-        `, {});
-        
-        deletedCount = result.records[0]?.get('deleted')?.toNumber?.() || result.records[0]?.get('deleted') || 0;
-        batchCount++;
-        if (deletedCount > 0) {
-          console.log(`   Batch ${batchCount}: deleted ${deletedCount} nodes...`);
-        }
-      } while (deletedCount > 0);
-      
-      console.log(`✅ All graph data cleared`);
+      await deleteBatched(
+        `MATCH ()-[r]-()
+         WITH r LIMIT ${BATCH_SIZE}
+         DELETE r
+         RETURN count(*) as deleted`,
+        `MATCH (n)
+         WITH n LIMIT ${BATCH_SIZE}
+         DELETE n
+         RETURN count(*) as deleted`,
+        {},
+        'All'
+      );
     }
   }
 
@@ -431,7 +450,7 @@ export class CodebaseScanner {
     return null;
   }
 
-  private async storeInGraph(entities: ParsedEntity[], relationships: ParsedRelationship[]): Promise<any[]> {
+  private async storeInGraph(entities: ParsedEntity[], relationships: ParsedRelationship[], skipEmbeddings?: boolean): Promise<any[]> {
     console.log(`📥 Storing entities...`);
     const errors: any[] = [];
     
@@ -505,14 +524,61 @@ export class CodebaseScanner {
     }
     const deduplicatedRelationships = Array.from(relationshipMap.values());
     
-    // Check if relationship targets exist in entities
+    // Check if relationship sources/targets exist in entities
     const entityIds = new Set(deduplicatedEntities.map(e => e.id));
-    
-    // Filter out relationships where source or target doesn't exist
-    const storableRelationships = deduplicatedRelationships.filter(r => 
-      entityIds.has(r.source) && entityIds.has(r.target)
-    );
-    
+
+    // For every IMPLEMENTS edge whose interface target is not in the current
+    // scan (e.g. a framework interface shipped as a JAR), create a lightweight
+    // stub node so the edge can be stored and later queried.  We use the
+    // project_id of the implementing class as the owner.
+    const stubsToStore: ParsedEntity[] = [];
+    for (const r of deduplicatedRelationships) {
+      if (r.type === 'implements' && !entityIds.has(r.target)) {
+        // Derive project_id from the source entity (the implementing class)
+        const sourceEntity = deduplicatedEntities.find(e => e.id === r.source);
+        const projectId = sourceEntity?.project_id ?? r.project_id;
+        const stub: ParsedEntity = {
+          id: r.target,
+          project_id: projectId,
+          type: 'interface',
+          name: r.target.split('.').pop() ?? r.target,
+          qualified_name: r.target,
+          source_file: 'external',
+          modifiers: [],
+          annotations: []
+        };
+        entityIds.add(r.target); // prevent duplicates in subsequent loop iterations
+        stubsToStore.push(stub);
+      }
+    }
+
+    if (stubsToStore.length > 0) {
+      console.log(`📋 Creating ${stubsToStore.length} stub interface nodes for external/dependency targets`);
+      for (const stub of stubsToStore) {
+        try {
+          await this.nodeManager.addNode({
+            id: stub.id,
+            project_id: stub.project_id,
+            type: stub.type as any,
+            name: stub.name,
+            qualified_name: stub.qualified_name,
+            source_file: stub.source_file,
+            modifiers: stub.modifiers
+          });
+        } catch {
+          // Already exists from a prior scan — that's fine
+        }
+      }
+    }
+
+    // Filter out relationships where source doesn't exist.
+    // IMPLEMENTS targets are now guaranteed to exist (either scanned or stub).
+    const storableRelationships = deduplicatedRelationships.filter(r => {
+      if (!entityIds.has(r.source)) return false;
+      if (!entityIds.has(r.target)) return false;
+      return true;
+    });
+
     // Count skipped relationships by type for informational logging
     const skippedByType: Record<string, number> = {};
     for (const r of deduplicatedRelationships) {
@@ -520,7 +586,7 @@ export class CodebaseScanner {
         skippedByType[r.type] = (skippedByType[r.type] || 0) + 1;
       }
     }
-    
+
     const totalSkipped = deduplicatedRelationships.length - storableRelationships.length;
     if (totalSkipped > 0) {
       console.log(`📋 Skipping ${totalSkipped} relationships with external/missing targets:`);
@@ -530,35 +596,41 @@ export class CodebaseScanner {
     }
     
     console.log(`📋 Storing ${storableRelationships.length} relationships`);
-    
-    // Store relationships sequentially to avoid Neo4j deadlocks
-    // Neo4j can deadlock when parallel transactions try to lock the same nodes/relationships
-    let storedCount = 0;
-    for (const relationship of storableRelationships) {
-      try {
-        await this.storeRelationshipWithRetry(relationship, 3);
-        storedCount++;
-        if (storedCount % 1000 === 0) {
-          console.log(`📊 Stored ${storedCount}/${storableRelationships.length} relationships`);
-        }
-      } catch (error) {
-        // Skip duplicates or other relationship creation errors
-        if (!(error instanceof Error) || !error.message.includes('already exists')) {
-          console.warn(`Failed to store relationship ${relationship.id}: ${error instanceof Error ? error.message : String(error)}`);
-          errors.push({
-            type: 'edge_creation_error',
-            relationship_id: relationship.id,
-            source: relationship.source,
-            target: relationship.target,
-            message: error instanceof Error ? error.message : String(error),
-            severity: 'error'
-          });
-        }
+
+    // Batch-insert relationships grouped by type using UNWIND queries.
+    // This replaces the previous one-by-one approach and reduces DB round-trips
+    // from N to ceil(N / 500) * numTypes.
+    const batchResult = await this.edgeManager.addEdgesBatch(
+      storableRelationships.map(r => ({
+        id: r.id,
+        project_id: r.project_id,
+        type: r.type as any,
+        source: r.source,
+        target: r.target,
+        attributes: r.attributes
+      }))
+    );
+
+    const storedCount = batchResult.stored;
+
+    for (const { edge, error } of batchResult.errors) {
+      if (!error.includes('already exists')) {
+        console.warn(`Failed to store relationship ${edge.id}: ${error}`);
+        errors.push({
+          type: 'edge_creation_error',
+          relationship_id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          message: error,
+          severity: 'error'
+        });
       }
     }
 
-    // Generate embeddings if semantic search is enabled
-    if (this.embeddingService.isEnabled()) {
+    // Generate embeddings if semantic search is enabled and not skipped
+    if (skipEmbeddings) {
+      console.log(`🧠 Skipping embedding generation (--no-embeddings flag)`);
+    } else if (this.embeddingService.isEnabled()) {
       console.log(`🧠 Generating semantic embeddings for ${successfullyStoredEntities.length} entities...`);
       try {
         const embeddingResult = await this.generateEmbeddingsForEntities(successfullyStoredEntities);

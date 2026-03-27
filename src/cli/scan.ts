@@ -220,7 +220,9 @@ program
         useCache: options.useCache,
         cacheOptions: {
           forceRefresh: options.clearCache
-        }
+        },
+        // Embedding settings
+        skipEmbeddings: options.embeddings === false
       };
 
       console.log(`\n⚙️ Scan Configuration:`);
@@ -286,40 +288,9 @@ program
 
       }
 
-      // Generate embeddings automatically (unless --no-embeddings is specified)
-      if (options.embeddings !== false) {
-        const { getSemanticSearchConfig } = await import('../config.js');
-        const semanticConfig = getSemanticSearchConfig();
-        
-        if (semanticConfig.provider === 'disabled') {
-          console.log(`\n⚠️ Semantic search is disabled. Skipping embedding generation.`);
-          console.log(`   Set SEMANTIC_SEARCH_PROVIDER to 'openai' or 'ollama' to enable.`);
-        } else {
-          console.log(`\n🧠 Generating embeddings...`);
-          console.log(`   Provider: ${semanticConfig.provider} | Model: ${semanticConfig.model}`);
-          
-          try {
-            const { EmbeddingService } = await import('../services/embedding-service.js');
-            const { SemanticSearchManager } = await import('../services/semantic-search-manager.js');
-            
-            const embeddingService = new EmbeddingService();
-            const semanticSearchManager = new SemanticSearchManager(client, embeddingService);
-            
-            const embeddingResult = await semanticSearchManager.updateEmbeddings(projectId);
-            
-            console.log(`   ✅ Embeddings generated: ${embeddingResult.updated} entities`);
-            if (embeddingResult.failed > 0) {
-              console.log(`   ⚠️ Failed: ${embeddingResult.failed} entities`);
-            }
-          } catch (embeddingError) {
-            console.error(`   ❌ Embedding generation failed:`, embeddingError instanceof Error ? embeddingError.message : String(embeddingError));
-            console.log(`   You can retry later with: coderag-scan embeddings -p ${projectId}`);
-          }
-        }
-      }
-
-      await client.disconnect();
       console.log(`\n✅ Scan completed successfully!`);
+      client.disconnect().catch(() => {}).finally(() => process.exit(0));
+      setTimeout(() => process.exit(0), 3000);
 
     } catch (error) {
       console.error(`\n❌ Scan failed:`, error instanceof Error ? error.message : String(error));
@@ -350,8 +321,9 @@ program
       const scanner = new CodebaseScanner(client);
       await scanner.clearGraph();
 
-      await client.disconnect();
       console.log(`✅ Graph database cleared successfully.`);
+      client.disconnect().catch(() => {}).finally(() => process.exit(0));
+      setTimeout(() => process.exit(0), 3000);
 
     } catch (error) {
       console.error(`❌ Failed to clear graph:`, error instanceof Error ? error.message : String(error));
