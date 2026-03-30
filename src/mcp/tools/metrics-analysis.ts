@@ -1,4 +1,5 @@
 import { MetricsManager } from '../../analysis/metrics-manager.js';
+import { createPaginatedResponse } from '../../utils/token-limiter.js';
 
 // Metrics Analysis Tool Parameters
 export interface CalculateCKMetricsParams {
@@ -157,11 +158,13 @@ ${JSON.stringify(result, null, 2)}`
 }
 
 export async function findArchitecturalIssues(
-  metricsManager: MetricsManager
+  metricsManager: MetricsManager,
+  params: { limit?: number; offset?: number } = {}
 ) {
   const result = await metricsManager.findArchitecturalIssues();
+  const paginated = createPaginatedResponse(result, params.offset || 0, params.limit);
   return {
-    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+    content: [{ type: 'text' as const, text: JSON.stringify(paginated, null, 2) }]
   };
 }
 

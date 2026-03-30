@@ -11,6 +11,7 @@ import { EdgeManager } from '../graph/edge-manager.js';
 import { MetricsManager } from '../analysis/metrics-manager.js';
 import { SemanticSearchManager } from '../services/semantic-search-manager.js';
 import { EmbeddingService } from '../services/embedding-service.js';
+import { findArchitecturalIssues } from './tools/metrics-analysis.js';
 
 export class HTTPHandler {
   private app: express.Application;
@@ -81,6 +82,7 @@ export class HTTPHandler {
     // Tool: Find nodes by type
     server.tool(
       'find_nodes_by_type',
+      'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name.',
       {
         nodeType: z.enum(['Class', 'Interface', 'Enum', 'Exception', 'Method', 'Function', 'Field', 'Package', 'Module']),
         projectId: z.string()
@@ -99,6 +101,7 @@ export class HTTPHandler {
     // Tool: Search nodes
     server.tool(
       'search_nodes',
+      'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. Examples: "find method validate", "search for interface Repository".',
       {
         searchTerm: z.string(),
         projectId: z.string()
@@ -117,6 +120,7 @@ export class HTTPHandler {
     // Tool: Get node details
     server.tool(
       'get_node',
+      'Get detailed information about a specific code entity by its unique ID. Use this after search_nodes to get full details about a class, method, or other entity.',
       {
         nodeId: z.string(),
         projectId: z.string()
@@ -135,6 +139,7 @@ export class HTTPHandler {
     // Tool: Find inheritance hierarchy
     server.tool(
       'find_inheritance_hierarchy',
+      'Get the full ancestor chain for a class by traversing EXTENDS edges upward (child → parent → grandparent). Returns all superclasses up to the root.',
       {
         className: z.string(),
         projectId: z.string()
@@ -153,6 +158,7 @@ export class HTTPHandler {
     // Tool: Find implementations
     server.tool(
       'find_implementations',
+      'Find all classes that implement an interface OR extend an abstract class. Searches both IMPLEMENTS and EXTENDS edges, and uses the is_abstract flag to correctly handle abstract class hierarchies.',
       {
         interfaceName: z.string(),
         projectId: z.string()
@@ -171,6 +177,7 @@ export class HTTPHandler {
     // Tool: Find method callers
     server.tool(
       'find_method_callers',
+      'Find all classes that call a specific method.',
       {
         methodName: z.string(),
         projectId: z.string()
@@ -189,6 +196,7 @@ export class HTTPHandler {
     // Tool: Calculate CK metrics
     server.tool(
       'calculate_ck_metrics',
+      'Calculate Chidamber & Kemerer object-oriented quality metrics for a class: WMC (complexity), DIT (inheritance depth), NOC (children), CBO (coupling), RFC (reachable methods), LCOM (cohesion). High CBO/WMC/RFC = risky to change.',
       {
         classId: z.string()
       },
@@ -203,11 +211,33 @@ export class HTTPHandler {
       }
     );
 
+    // Tool: List packages
+    server.tool(
+      'list_packages',
+      'List all packages found in a project, derived from qualified class names. Call this first to discover valid package names before calling calculate_package_metrics.',
+      {
+        projectId: z.string().optional().describe('Project ID to scope the operation to'),
+        depth: z.number().optional().describe('Package depth to group by (default: 3, e.g. com.example.module)')
+      },
+      async ({ projectId, depth }) => {
+        const packages = await this.metricsManager.listPackages(projectId, depth ?? 3);
+        return {
+          content: [{
+            type: 'text',
+            text: packages.length > 0
+              ? `Found ${packages.length} packages (depth=${depth ?? 3}):\n${packages.join('\n')}`
+              : 'No packages found. Ensure nodes have qualified_name properties.'
+          }]
+        };
+      }
+    );
+
     // Tool: Calculate package metrics
     server.tool(
       'calculate_package_metrics',
+      'Calculate package coupling metrics (Ca, Ce, Instability, Abstractness, Distance from Main Sequence). Use list_packages first to discover valid packageName values.',
       {
-        packageName: z.string()
+        packageName: z.string().describe('Fully qualified package name, e.g. com.example.module — use list_packages to find valid names')
       },
       async ({ packageName }) => {
         const metrics = await this.metricsManager.calculatePackageMetrics(packageName);
@@ -223,21 +253,17 @@ export class HTTPHandler {
     // Tool: Find architectural issues
     server.tool(
       'find_architectural_issues',
+      'Detect architectural anti-patterns across the codebase: circular dependencies, god classes (too many methods or high coupling), and highly coupled classes. Returns paginated results — use limit/offset for large codebases.',
       {},
-      async () => {
-        const issues = await this.metricsManager.findArchitecturalIssues();
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(issues, null, 2)
-          }]
-        };
+      async (args: any) => {
+        return await findArchitecturalIssues(this.metricsManager, args);
       }
     );
 
     // Tool: List projects  
     server.tool(
       'list_projects',
+      'List all projects in the CodeRAG graph database with optional statistics.',
       {
         includeStats: z.boolean().optional(),
         sortBy: z.enum(['name', 'created_at', 'updated_at', 'entity_count']).optional(),
@@ -262,6 +288,7 @@ export class HTTPHandler {
     // Tool: Add node
     server.tool(
       'add_node',
+      'Add a new code node (class, interface, method, etc.) to the graph.',
       {
         project: z.string(),
         id: z.string(),
@@ -302,6 +329,7 @@ export class HTTPHandler {
     // Tool: Update node
     server.tool(
       'update_node',
+      'Update an existing code node.',
       {
         project: z.string(),
         id: z.string(),
@@ -321,6 +349,7 @@ export class HTTPHandler {
     // Tool: Delete node
     server.tool(
       'delete_node',
+      'Delete a code node by ID.',
       {
         project: z.string(),
         id: z.string()
@@ -339,6 +368,7 @@ export class HTTPHandler {
     // Tool: Add edge
     server.tool(
       'add_edge',
+      'Add a relationship edge between two nodes.',
       {
         project: z.string(),
         id: z.string(),
@@ -369,6 +399,7 @@ export class HTTPHandler {
     // Tool: Get edge
     server.tool(
       'get_edge',
+      'Get an edge by ID.',
       {
         project: z.string(),
         id: z.string()
@@ -387,6 +418,7 @@ export class HTTPHandler {
     // Tool: Delete edge
     server.tool(
       'delete_edge',
+      'Delete an edge by ID.',
       {
         project: z.string(),
         id: z.string()
@@ -405,6 +437,7 @@ export class HTTPHandler {
     // Tool: Find edges by source
     server.tool(
       'find_edges_by_source',
+      'Find all outgoing relationships from a node. Edge types: calls (method→method), implements (class→interface), extends (class→class), contains (class→method/field), references (class→class), throws (method→exception), belongs_to (method→class).',
       {
         project: z.string(),
         sourceId: z.string()
@@ -423,6 +456,7 @@ export class HTTPHandler {
     // Tool: Project summary
     server.tool(
       'get_project_summary',
+      'Get overall project metrics summary and quality assessment.',
       {
         project: z.string().optional()
       },
@@ -440,6 +474,7 @@ export class HTTPHandler {
     // Tool: Add file (scanning)
     server.tool(
       'add_file',
+      'Parse a single source file and add its entities to the graph.',
       {
         project: z.string(),
         file_path: z.string(),
@@ -460,6 +495,7 @@ export class HTTPHandler {
     // Tool: Scan directory
     server.tool(
       'scan_dir',
+      'Scan a directory for source files and populate the graph.',
       {
         project: z.string(),
         directory_path: z.string(),
@@ -484,6 +520,7 @@ export class HTTPHandler {
     // Annotation analysis tools
     server.tool(
       'find_nodes_by_annotation',
+      'Find code nodes (classes, methods, etc.) that have specific annotations/decorators.',
       {
         project: z.string(),
         annotation_name: z.string(),
@@ -505,6 +542,7 @@ export class HTTPHandler {
 
     server.tool(
       'get_framework_usage',
+      'Get statistics on framework usage based on annotations/decorators across the codebase.',
       {
         project: z.string(),
         include_parameters: z.boolean().optional(),
@@ -524,6 +562,7 @@ export class HTTPHandler {
 
     server.tool(
       'get_annotation_usage',
+      'Get comprehensive statistics on annotation/decorator usage patterns across the codebase.',
       {
         project: z.string(),
         category: z.string().optional(),
@@ -545,6 +584,7 @@ export class HTTPHandler {
 
     server.tool(
       'find_deprecated_code',
+      'Find all code elements marked as deprecated and optionally their dependencies.',
       {
         project: z.string(),
         include_dependencies: z.boolean().optional(),
@@ -564,6 +604,7 @@ export class HTTPHandler {
 
     server.tool(
       'find_usage_of_deprecated_code',
+      'Find code that uses deprecated elements and assess migration impact.',
       {
         project: z.string(),
         include_usage_details: z.boolean().optional()
@@ -582,6 +623,7 @@ export class HTTPHandler {
 
     server.tool(
       'analyze_testing_annotations',
+      'Analyze testing patterns and coverage based on test annotations/decorators.',
       {
         project: z.string(),
         framework: z.string().optional(),
@@ -601,6 +643,7 @@ export class HTTPHandler {
 
     server.tool(
       'find_untestable_code',
+      'Find code patterns that may be difficult to test (private methods, static methods, etc.).',
       {
         project: z.string()
       },

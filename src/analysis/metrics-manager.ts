@@ -325,6 +325,25 @@ export class MetricsManager {
     return result.records[0]?.get('total').toNumber() || 0;
   }
 
+  async listPackages(projectId?: string, depth: number = 3): Promise<string[]> {
+    const projectFilter = projectId ? 'AND n.project_id = $projectId' : '';
+    const query = `
+      MATCH (n:CodeNode)
+      WHERE n.qualified_name CONTAINS '.'
+        ${projectFilter}
+      WITH split(n.qualified_name, '.') as parts
+      WHERE size(parts) > $depth
+      WITH reduce(pkg = '', i IN range(0, $depth - 1) |
+        pkg + CASE WHEN i > 0 THEN '.' ELSE '' END + parts[i]) as package
+      RETURN DISTINCT package
+      ORDER BY package
+    `;
+    const params: Record<string, any> = { depth };
+    if (projectId) params.projectId = projectId;
+    const result = await this.client.runQuery(query, params);
+    return result.records.map(r => r.get('package'));
+  }
+
   private async getAverageMetrics(): Promise<{ avgCBO: number; avgRFC: number; avgDIT: number }> {
     const query = `
       MATCH (class:CodeNode {type: 'class'})

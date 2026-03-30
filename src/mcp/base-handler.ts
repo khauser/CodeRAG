@@ -140,6 +140,8 @@ export abstract class BaseHandler {
             return await this.handleGetInheritanceHierarchy(request.params.arguments);
           case 'calculate_ck_metrics':
             return await this.handleCalculateCKMetrics(request.params.arguments);
+          case 'list_packages':
+            return await this.handleListPackages(request.params.arguments);
           case 'calculate_package_metrics':
             return await this.handleCalculatePackageMetrics(request.params.arguments);
           case 'find_architectural_issues':
@@ -524,13 +526,25 @@ export abstract class BaseHandler {
         }
       },
       {
-        name: 'calculate_package_metrics',
-        description: 'Calculate package metrics (Afferent/Efferent Coupling, Instability, Abstractness, Distance)',
+        name: 'list_packages',
+        description: 'List all packages found in the project, derived from qualified class names. Use this to discover package names before calling calculate_package_metrics.',
         inputSchema: {
           type: 'object',
           properties: {
             project: { type: 'string', description: 'Project name or identifier to scope the operation to' },
-            package_name: { type: 'string', description: 'Package name to analyze' }
+            depth: { type: 'number', description: 'Package depth to group by (default: 3, e.g. com.example.module)' }
+          },
+          required: ['project']
+        }
+      },
+      {
+        name: 'calculate_package_metrics',
+        description: 'Calculate package metrics (Afferent/Efferent Coupling, Instability, Abstractness, Distance). Use list_packages first to find valid package names.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            project: { type: 'string', description: 'Project name or identifier to scope the operation to' },
+            package_name: { type: 'string', description: 'Package name to analyze (e.g. com.example.module)' }
           },
           required: ['project', 'package_name']
         }
@@ -1090,12 +1104,29 @@ export abstract class BaseHandler {
     return await calculateCKMetrics(this.metricsManager, args as CalculateCKMetricsParams, this.detailLevel);
   }
 
+  protected async handleListPackages(args: any) {
+    const projectId = args?.project;
+    const depth = args?.depth ?? 3;
+    const packages = await this.metricsManager.listPackages(projectId, depth);
+    return {
+      content: [{
+        type: 'text',
+        text: packages.length > 0
+          ? `Found ${packages.length} packages (depth=${depth}):\n${packages.join('\n')}`
+          : 'No packages found. Ensure nodes have qualified_name properties.'
+      }]
+    };
+  }
+
   protected async handleCalculatePackageMetrics(args: any) {
-    return await calculatePackageMetrics(this.metricsManager, args as CalculatePackageMetricsParams, this.detailLevel);
+    const params: CalculatePackageMetricsParams = {
+      packageName: args?.packageName ?? args?.package_name
+    };
+    return await calculatePackageMetrics(this.metricsManager, params, this.detailLevel);
   }
 
   protected async handleFindArchitecturalIssues(args: any) {
-    return await findArchitecturalIssues(this.metricsManager);
+    return await findArchitecturalIssues(this.metricsManager, args);
   }
 
   protected async handleGetProjectSummary(args: any) {
