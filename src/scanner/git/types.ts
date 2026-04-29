@@ -1,6 +1,6 @@
 export interface ParsedGitUrl {
   protocol: 'https' | 'ssh' | 'git';
-  provider: 'github' | 'gitlab' | 'bitbucket' | 'custom';
+  provider: 'github' | 'gitlab' | 'bitbucket' | 'azure' | 'custom';
   host: string;
   owner: string;
   repo: string;
@@ -52,6 +52,10 @@ export interface GitAuthConfig {
   bitbucket?: {
     username?: string;
     appPassword?: string;
+  };
+  azure?: {
+    pat?: string;
+    organization?: string;
   };
   ssh?: {
     privateKey?: string;

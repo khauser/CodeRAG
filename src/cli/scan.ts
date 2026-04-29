@@ -20,11 +20,13 @@ Authentication for private repositories:
   - GITHUB_TOKEN for GitHub repositories
   - GITLAB_TOKEN for GitLab repositories  
   - BITBUCKET_USERNAME and BITBUCKET_APP_PASSWORD for Bitbucket
+  - AZURE_DEVOPS_PAT for Azure Repos (Personal Access Token)
   
 Examples:
   coderag-scan ./my-project
   coderag-scan https://github.com/owner/repo.git
-  GITHUB_TOKEN=ghp_xxx coderag-scan https://github.com/private/repo.git`)
+  GITHUB_TOKEN=ghp_xxx coderag-scan https://github.com/private/repo.git
+  AZURE_DEVOPS_PAT=xxx coderag-scan https://dev.azure.com/org/project/_git/repo`)
   .version('1.0.0');
 
 program
@@ -70,6 +72,10 @@ program
         bitbucket: {
           username: process.env.BITBUCKET_USERNAME,
           appPassword: process.env.BITBUCKET_APP_PASSWORD
+        },
+        azure: {
+          pat: process.env.AZURE_DEVOPS_PAT,
+          organization: process.env.AZURE_DEVOPS_ORG
         }
       };
       

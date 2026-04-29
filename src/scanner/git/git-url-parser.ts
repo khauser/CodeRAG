@@ -13,8 +13,17 @@ export class GitUrlParser {
   private static readonly KNOWN_PROVIDERS = {
     'github.com': 'github',
     'gitlab.com': 'gitlab',
-    'bitbucket.org': 'bitbucket'
+    'bitbucket.org': 'bitbucket',
+    'dev.azure.com': 'azure'
   } as const;
+
+  // Azure DevOps URL pattern: https://dev.azure.com/{org}/{project}/_git/{repo}
+  // or https://{org}.visualstudio.com/{project}/_git/{repo}
+  private static readonly AZURE_DEVOPS_PATTERNS = [
+    /^https?:\/\/dev\.azure\.com\/([^\/]+)\/([^\/]+)\/_git\/([^\/]+?)(?:\.git)?(?:\/.*)?$/,
+    /^https?:\/\/([^\.]+)\.visualstudio\.com\/([^\/]+)\/_git\/([^\/]+?)(?:\.git)?(?:\/.*)?$/,
+    /^([^\.]+)@vs-ssh\.visualstudio\.com:v3\/([^\/]+)\/([^\/]+)\/([^\/]+?)(?:\.git)?$/
+  ];
 
   static parse(url: string): ParsedGitUrl {
     if (!url || typeof url !== 'string') {
@@ -23,6 +32,49 @@ export class GitUrlParser {
 
     const trimmedUrl = url.trim();
     
+    // Try Azure DevOps patterns first (more specific)
+    // SSH: git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+    const azureSshMatch = trimmedUrl.match(/^git@ssh\.dev\.azure\.com:v3\/([^\/]+)\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+    if (azureSshMatch) {
+      const [, org, project, repo] = azureSshMatch;
+      return {
+        protocol: 'ssh',
+        provider: 'azure',
+        host: 'ssh.dev.azure.com',
+        owner: `${org}/${project}`,
+        repo: this.cleanRepoName(repo),
+        originalUrl: trimmedUrl
+      };
+    }
+
+    // HTTPS: https://dev.azure.com/{org}/{project}/_git/{repo}
+    // Also handles: https://{user}@dev.azure.com/{org}/{project}/_git/{repo}
+    const azureHttpsMatch = trimmedUrl.match(/^https?:\/\/(?:[^@]+@)?dev\.azure\.com\/([^\/]+)\/([^\/]+)\/_git\/([^\/]+?)(?:\.git)?(?:\/.*)?$/);
+    if (azureHttpsMatch) {
+      const [, org, project, repo] = azureHttpsMatch;
+      return {
+        protocol: 'https',
+        provider: 'azure',
+        host: 'dev.azure.com',
+        owner: `${org}/${project}`,
+        repo: this.cleanRepoName(repo),
+        originalUrl: trimmedUrl
+      };
+    }
+
+    const azureVsMatch = trimmedUrl.match(/^https?:\/\/([^\.]+)\.visualstudio\.com\/([^\/]+)\/_git\/([^\/]+?)(?:\.git)?(?:\/.*)?$/);
+    if (azureVsMatch) {
+      const [, org, project, repo] = azureVsMatch;
+      return {
+        protocol: 'https',
+        provider: 'azure',
+        host: `${org}.visualstudio.com`,
+        owner: `${org}/${project}`,
+        repo: this.cleanRepoName(repo),
+        originalUrl: trimmedUrl
+      };
+    }
+
     // Try HTTPS pattern
     const httpsMatch = trimmedUrl.match(/^https?:\/\/([^\/]+)\/([^\/]+)\/([^\/]+?)(?:\.git)?(?:\/.*)?$/);
     if (httpsMatch) {
@@ -100,6 +152,10 @@ export class GitUrlParser {
 
   static buildCloneUrl(parsedUrl: ParsedGitUrl, useToken?: string): string {
     if (parsedUrl.protocol === 'ssh') {
+      // Azure DevOps SSH has a special format
+      if (parsedUrl.provider === 'azure') {
+        return `git@ssh.dev.azure.com:v3/${parsedUrl.owner}/${parsedUrl.repo}`;
+      }
       return `git@${parsedUrl.host}:${parsedUrl.owner}/${parsedUrl.repo}.git`;
     }
 
@@ -111,11 +167,20 @@ export class GitUrlParser {
       return `https://oauth2:${useToken}@${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`;
     }
 
+    if (useToken && parsedUrl.provider === 'azure') {
+      if (parsedUrl.host === 'dev.azure.com' || parsedUrl.host === 'ssh.dev.azure.com') {
+        return `https://pat:${useToken}@dev.azure.com/${parsedUrl.owner}/_git/${parsedUrl.repo}`;
+      }
+      return `https://pat:${useToken}@${parsedUrl.host}/${parsedUrl.owner.split('/')[1]}/_git/${parsedUrl.repo}`;
+    }
+
     return `https://${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`;
   }
 
   private static getProvider(host: string): ParsedGitUrl['provider'] {
     const normalizedHost = host.toLowerCase();
+    if (normalizedHost.endsWith('.visualstudio.com')) return 'azure';
+    if (normalizedHost === 'ssh.dev.azure.com') return 'azure';
     return (this.KNOWN_PROVIDERS[normalizedHost as keyof typeof this.KNOWN_PROVIDERS]) || 'custom';
   }
 

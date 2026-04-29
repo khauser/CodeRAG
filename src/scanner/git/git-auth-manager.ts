@@ -23,6 +23,10 @@ export class GitAuthManager {
       bitbucket: {
         username: process.env.BITBUCKET_USERNAME,
         appPassword: process.env.BITBUCKET_APP_PASSWORD
+      },
+      azure: {
+        pat: process.env.AZURE_DEVOPS_PAT,
+        organization: process.env.AZURE_DEVOPS_ORG
       }
     };
 
@@ -65,6 +69,14 @@ export class GitAuthManager {
       };
     }
 
+    // Handle Azure DevOps PAT authentication
+    if (providerConfig && 'pat' in providerConfig && providerConfig.pat) {
+      return {
+        cloneUrl: this.buildAuthenticatedUrl(parsedUrl, providerConfig.pat),
+        envVars: this.getEnvironmentVariables(parsedUrl.provider, providerConfig)
+      };
+    }
+
     // Return public URL
     return {
       cloneUrl: `https://${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`
@@ -95,6 +107,15 @@ export class GitAuthManager {
         isValid: isTokenValid,
         method: 'token',
         warnings: isTokenValid ? [] : ['Token appears to be invalid format']
+      };
+    }
+
+    if (providerConfig && 'pat' in providerConfig && providerConfig.pat) {
+      const isTokenValid = this.validateToken(providerConfig.pat);
+      return {
+        isValid: isTokenValid,
+        method: 'token',
+        warnings: isTokenValid ? [] : ['PAT appears to be invalid format']
       };
     }
 
@@ -130,6 +151,8 @@ export class GitAuthManager {
         return this.authConfig.gitlab;
       case 'bitbucket':
         return this.authConfig.bitbucket;
+      case 'azure':
+        return this.authConfig.azure;
       default:
         return null;
     }
@@ -147,6 +170,14 @@ export class GitAuthManager {
           return `https://${config.username}:${config.appPassword}@${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`;
         }
         return `https://${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`;
+      case 'azure':
+        // Azure DevOps uses PAT as password with empty/any username
+        if (parsedUrl.host === 'dev.azure.com' || parsedUrl.host === 'ssh.dev.azure.com') {
+          return `https://pat:${token}@dev.azure.com/${parsedUrl.owner}/_git/${parsedUrl.repo}`;
+        }
+        // visualstudio.com format
+        const project = parsedUrl.owner.split('/')[1];
+        return `https://pat:${token}@${parsedUrl.host}/${project}/_git/${parsedUrl.repo}`;
       default:
         return `https://${token}@${parsedUrl.host}/${parsedUrl.owner}/${parsedUrl.repo}.git`;
     }
@@ -181,6 +212,7 @@ export class GitAuthManager {
       github: { ...base.github, ...override.github },
       gitlab: { ...base.gitlab, ...override.gitlab },
       bitbucket: { ...base.bitbucket, ...override.bitbucket },
+      azure: { ...base.azure, ...override.azure },
       ssh: { ...base.ssh, ...override.ssh }
     };
   }
