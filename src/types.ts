@@ -33,6 +33,17 @@ export interface CodeNode {
     annotations?: AnnotationInfo[];
     framework?: string;            // For annotation nodes: the framework (Spring, JUnit, etc.)
     category?: string;             // For annotation nodes: the category (testing, injection, etc.)
+    // Method-specific properties
+    body_text?: string;            // Raw method body text
+    body_summary?: string;         // Short summary of method behavior (LLM-generated or extracted)
+    called_symbol_names?: string[];// Names of methods/functions called within this method
+    used_field_names?: string[];   // Field names accessed within this method
+    thrown_exceptions?: string[];  // Exception types thrown by this method
+    domain_terms?: string[];       // Domain-relevant terms extracted from the method
+    cyclomatic_complexity?: number;// Cyclomatic complexity metric
+    line_count?: number;           // Number of lines in the method body
+    is_generated?: boolean;        // Whether the method is auto-generated (e.g., lombok, IDE)
+    is_test?: boolean;             // Whether this is a test method
     [key: string]: any;
   };
 }

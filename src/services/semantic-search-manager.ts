@@ -1,6 +1,6 @@
 import neo4j from 'neo4j-driver';
 import { Neo4jClient } from '../graph/neo4j-client.js';
-import { EmbeddingService } from './embedding-service.js';
+import { EmbeddingService, NodeContext } from './embedding-service.js';
 import { CodeNode, SemanticSearchParams, SemanticSearchResult, SemanticEmbedding } from '../types.js';
 import { getSemanticSearchConfig } from '../config.js';
 
@@ -282,8 +282,14 @@ export class SemanticSearchManager {
       const batch = nodes.slice(i, i + batchSize);
       
       try {
-        // Extract semantic content for the batch
-        const texts = batch.map(node => this.embeddingService.extractSemanticContent(node));
+        // Fetch context for class/interface/enum nodes, then extract semantic content
+        const texts = await Promise.all(batch.map(async (node) => {
+          if (node.type === 'class' || node.type === 'interface' || node.type === 'enum') {
+            const context = await this.fetchNodeContext(node);
+            return this.embeddingService.extractSemanticContent(node, context);
+          }
+          return this.embeddingService.extractSemanticContent(node);
+        }));
         
         // Generate embeddings
         const embeddings = await this.embeddingService.generateEmbeddings(texts);
@@ -327,6 +333,144 @@ export class SemanticSearchManager {
 
     console.log(`✅ Embedding update completed. Updated: ${updated}, Failed: ${failed}`);
     return { updated, failed };
+  }
+
+  /**
+   * Fetches enrichment context for a class/interface/enum node from the graph.
+   * Queries EXTENDS, IMPLEMENTS, and CONTAINS edges plus child node metadata
+   * to build a {@link NodeContext} used for class-level summary embeddings.
+   *
+   * @param node the class/interface/enum code node
+   * @returns enrichment context gathered from graph relationships
+   */
+  private async fetchNodeContext(node: CodeNode): Promise<NodeContext> {
+    const context: NodeContext = {};
+
+    try {
+      // Fetch superclass (EXTENDS edge)
+      const extendsResult = await this.neo4jClient.runQuery(
+        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:EXTENDS]->(parent:CodeNode)
+         RETURN parent.name AS name LIMIT 1`,
+        { id: node.id, projectId: node.project_id }
+      );
+      if (extendsResult.records.length > 0) {
+        context.superclass = extendsResult.records[0].get('name');
+      }
+
+      // Fetch implemented interfaces (IMPLEMENTS edges)
+      const implResult = await this.neo4jClient.runQuery(
+        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:IMPLEMENTS]->(iface:CodeNode)
+         RETURN iface.name AS name`,
+        { id: node.id, projectId: node.project_id }
+      );
+      if (implResult.records.length > 0) {
+        context.implemented_interfaces = implResult.records.map(r => r.get('name'));
+      }
+
+      // Fetch child methods (CONTAINS edges to method children)
+      const methodsResult = await this.neo4jClient.runQuery(
+        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:CONTAINS]->(m:CodeNode)
+         WHERE m.type = 'method'
+         RETURN m.name AS name, m.modifiers AS modifiers`,
+        { id: node.id, projectId: node.project_id }
+      );
+      if (methodsResult.records.length > 0) {
+        const publicMethods: string[] = [];
+        const privateMethods: string[] = [];
+        for (const r of methodsResult.records) {
+          const name = r.get('name');
+          const modifiers: string[] = r.get('modifiers') || [];
+          if (modifiers.includes('public')) {
+            publicMethods.push(name);
+          } else if (modifiers.includes('private')) {
+            privateMethods.push(name);
+          }
+        }
+        if (publicMethods.length > 0) {
+          context.public_methods = publicMethods;
+        }
+        if (privateMethods.length > 0) {
+          context.important_private_methods = privateMethods;
+        }
+      }
+
+      // Fetch injected dependencies (fields with @Inject annotation)
+      const depsResult = await this.neo4jClient.runQuery(
+        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:CONTAINS]->(f:CodeNode)
+         WHERE f.type = 'field'
+         RETURN f.name AS name, f.attributes AS attributes`,
+        { id: node.id, projectId: node.project_id }
+      );
+      if (depsResult.records.length > 0) {
+        const injected: string[] = [];
+        const repos: string[] = [];
+        for (const r of depsResult.records) {
+          const attrs = r.get('attributes');
+          const parsed = attrs ? (typeof attrs === 'string' ? JSON.parse(attrs) : attrs) : {};
+          const annotations: Array<{ name: string }> = parsed?.annotations || [];
+          const isInjected = annotations.some(a =>
+            a.name === '@Inject' || a.name === '@Autowired'
+          );
+          if (isInjected) {
+            const fieldName = r.get('name');
+            injected.push(fieldName);
+            if (fieldName.toLowerCase().includes('repository')) {
+              repos.push(fieldName);
+            }
+          }
+        }
+        if (injected.length > 0) {
+          context.injected_dependencies = injected;
+        }
+        if (repos.length > 0) {
+          context.repositories_used = repos;
+        }
+      }
+
+      // Derive module from source_file path
+      if (node.source_file) {
+        const moduleMatch = node.source_file.match(/(?:^|[/\\])((?:bc|ac|app|pf|ft|sld|init|orm)_[^/\\]+)/);
+        if (moduleMatch) {
+          context.module = moduleMatch[1];
+        }
+      }
+
+      // Derive architectural role from naming conventions and annotations
+      context.architectural_role = this.inferArchitecturalRole(node);
+
+    } catch (error) {
+      console.warn(`Failed to fetch context for node ${node.id}:`, error instanceof Error ? error.message : 'Unknown error');
+    }
+
+    return context;
+  }
+
+  /**
+   * Infers the architectural role of a class/interface/enum based on naming conventions
+   * and known annotation patterns.
+   *
+   * @param node the code node
+   * @returns a human-readable architectural role description, or undefined
+   */
+  private inferArchitecturalRole(node: CodeNode): string | undefined {
+    const name = node.name || '';
+    const annotations = node.attributes?.annotations?.map((a: any) => a.name) || [];
+
+    if (name.endsWith('Resource') || annotations.includes('@Path')) return 'REST resource';
+    if (name.endsWith('Request')) return 'REST request handler';
+    if (name.endsWith('Handler') && !name.endsWith('HandlerImpl')) return 'Handler interface';
+    if (name.endsWith('HandlerImpl')) return 'Handler implementation';
+    if (name.endsWith('BORepository')) return 'Business object repository';
+    if (name.endsWith('BO') && node.type === 'interface') return 'Business object interface';
+    if (name.endsWith('BOImpl')) return 'Business object implementation';
+    if (name.endsWith('PO')) return 'Persistent object';
+    if (name.endsWith('POKey')) return 'Persistent object key';
+    if (name.endsWith('DataRO') || name.endsWith('InfoRO')) return 'Resource object (DTO)';
+    if (name.endsWith('Module') || name.endsWith('CartridgeModule')) return 'Guice module';
+    if (name.endsWith('Mapper')) return 'Object mapper';
+    if (name.endsWith('Service')) return 'Application service';
+
+    return undefined;
   }
 
   private formatDuration(ms: number): string {
