@@ -14,6 +14,10 @@ export class GitRepositoryManager {
 
   constructor(authConfig: GitAuthConfig = {}) {
     this.git = simpleGit();
+    // Enable long paths support on Windows to handle paths longer than 260 characters
+    if (process.platform === 'win32') {
+      this.git.addConfig('core.longpaths', 'true', false, 'global');
+    }
     this.authManager = new GitAuthManager(authConfig);
     this.cacheManager = new GitCacheManager();
   }
@@ -110,6 +114,7 @@ export class GitRepositoryManager {
       try {
         // Clone the repository with progress tracking
         const git = simpleGit({
+          ...(process.platform === 'win32' ? { config: ['core.longpaths=true'] } : {}),
           progress: ({ stage, progress }) => {
             const percentage = 30 + (progress * 0.6); // 30-90% for cloning
             reportProgress({
