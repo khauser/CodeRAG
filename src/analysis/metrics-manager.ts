@@ -239,10 +239,34 @@ export class MetricsManager {
 
   // Architectural Analysis
   private async findCircularDependencies(): Promise<ArchitecturalIssue[]> {
-    // Use REFERENCES relationship to detect circular dependencies between classes
+    // Detect circular dependencies between classes, excluding bidirectional ORM
+    // parent-child relationships (e.g., ParentPO -> ChildPO -> ParentPO via owner reference).
+    // Exclusion criteria for 2-hop cycles:
+    //   1. Both classes end with "PO" and share the same package (ORM entity ownership), OR
+    //   2. One class name contains the other (nested/attribute value pattern)
     const query = `
-      MATCH (c1:CodeNode {type: 'class'})-[:REFERENCES*2..5]->(c2:CodeNode {type: 'class'})
+      MATCH path = (c1:CodeNode {type: 'class'})-[:REFERENCES*2..5]->(c2:CodeNode {type: 'class'})
       WHERE c1 = c2
+      WITH c1, nodes(path) as cycleNodes, length(path) as cycleLength
+      // Check if all nodes in cycle are PO classes in the same package (ORM ownership pattern)
+      WITH c1, cycleNodes, cycleLength,
+        reduce(pkg = replace(c1.qualified_name, '.' + c1.name, ''), n IN cycleNodes[1..] |
+          CASE WHEN pkg IS NOT NULL
+            AND replace(n.qualified_name, '.' + n.name, '') = replace(c1.qualified_name, '.' + c1.name, '')
+            AND n.name ENDS WITH 'PO'
+          THEN pkg ELSE null END
+        ) as sameOrmPackage
+      WITH c1, cycleNodes, cycleLength, sameOrmPackage,
+        CASE
+          WHEN c1.name ENDS WITH 'PO' AND sameOrmPackage IS NOT NULL THEN true
+          WHEN cycleLength = 2 AND
+            replace(c1.qualified_name, '.' + c1.name, '') =
+              replace(cycleNodes[1].qualified_name, '.' + cycleNodes[1].name, '')
+            AND (cycleNodes[1].name CONTAINS c1.name OR c1.name CONTAINS cycleNodes[1].name)
+          THEN true
+          ELSE false
+        END as isBidirectionalOrm
+      WHERE NOT isBidirectionalOrm
       RETURN DISTINCT c1.name as className
     `;
     const result = await this.client.runQuery(query);
