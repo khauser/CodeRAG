@@ -422,18 +422,22 @@ export class CodebaseScanner {
       // Read file content
       const content = await fs.promises.readFile(filePath, 'utf-8');
       
+      // Convert to relative path for storage (avoids storing temporary absolute paths)
+      const relativePath = path.relative(config.projectPath, filePath).replace(/\\/g, '/');
+      
       // Parse the file
-      const result = await parser.parseFile(filePath, content, config.projectId);
+      const result = await parser.parseFile(relativePath, content, config.projectId);
       
       return result;
 
     } catch (error) {
-      console.warn(`⚠️ Failed to process ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      const errorRelativePath = path.relative(config.projectPath, filePath).replace(/\\/g, '/');
+      console.warn(`⚠️ Failed to process ${errorRelativePath}: ${error instanceof Error ? error.message : String(error)}`);
       return {
         entities: [],
         relationships: [],
         errors: [{
-          file: filePath,
+          file: errorRelativePath,
           message: error instanceof Error ? error.message : String(error),
           severity: 'error'
         }]
