@@ -80,8 +80,8 @@ describe('Find Nodes By Annotation Tool', () => {
       const result = await findNodesByAnnotation(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('WHERE annotation.name = $annotation_name'),
-        { annotation_name: '@Component' }
+        expect.stringContaining('WHERE (a.name = $withAt OR a.name = $withoutAt)'),
+        { withAt: '@Component', withoutAt: 'Component' }
       );
       expect(result.nodes).toHaveLength(2);
       expect(result.nodes[0].name).toBe('TestClass');
@@ -129,8 +129,8 @@ describe('Find Nodes By Annotation Tool', () => {
       const result = await findNodesByAnnotation(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.framework = $framework'),
-        { annotation_name: '@Component', framework: 'Spring' }
+        expect.stringContaining('AND a.attributes_json CONTAINS $framework'),
+        { withAt: '@Component', withoutAt: 'Component', framework: 'Spring' }
       );
       expect(result.nodes).toHaveLength(1);
       expect(result.nodes[0].matched_annotation.framework).toBe('Spring');
@@ -174,8 +174,8 @@ describe('Find Nodes By Annotation Tool', () => {
       const result = await findNodesByAnnotation(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.category = $category'),
-        { annotation_name: '@Test', category: 'testing' }
+        expect.stringContaining('AND a.attributes_json CONTAINS $category'),
+        { withAt: '@Test', withoutAt: 'Test', category: 'testing' }
       );
       expect(result.nodes).toHaveLength(1);
       expect(result.nodes[0].matched_annotation.category).toBe('testing');
@@ -220,7 +220,7 @@ describe('Find Nodes By Annotation Tool', () => {
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
         expect.stringContaining('AND n.type = $node_type'),
-        { annotation_name: '@Entity', node_type: 'class' }
+        { withAt: '@Entity', withoutAt: 'Entity', node_type: 'class' }
       );
       expect(result.nodes).toHaveLength(1);
       expect(result.nodes[0].type).toBe('class');
@@ -267,9 +267,10 @@ describe('Find Nodes By Annotation Tool', () => {
       const result = await findNodesByAnnotation(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.framework = $framework'),
+        expect.stringContaining('AND a.attributes_json CONTAINS $framework'),
         {
-          annotation_name: '@RestController',
+          withAt: '@RestController',
+          withoutAt: 'RestController',
           framework: 'Spring',
           category: 'web',
           node_type: 'class'

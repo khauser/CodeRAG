@@ -140,8 +140,7 @@ export class GitCacheManager {
     
     for (const entry of this.cacheIndex.values()) {
       try {
-        const stats = await fs.stat(entry.localPath);
-        totalSize += stats.size;
+        totalSize += await this.getDirectorySize(entry.localPath);
         
         if (!oldestEntry || entry.lastUpdated < oldestEntry) {
           oldestEntry = entry.lastUpdated;
@@ -250,5 +249,24 @@ export class GitCacheManager {
     } catch {
       return undefined;
     }
+  }
+
+  private async getDirectorySize(dirPath: string): Promise<number> {
+    let size = 0;
+    try {
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          size += await this.getDirectorySize(fullPath);
+        } else {
+          const stats = await fs.stat(fullPath);
+          size += stats.size;
+        }
+      }
+    } catch {
+      // Directory might not exist
+    }
+    return size;
   }
 }

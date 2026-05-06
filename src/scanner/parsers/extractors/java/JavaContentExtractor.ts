@@ -193,13 +193,17 @@ export class JavaContentExtractor extends BaseContentExtractor {
       const [fullMatch, genericTypes, returnType, methodName, paramString, throwsClause] = match;
       const lineNumber = this.findLineNumber(content, methodName);
       
+      // Determine end line: use brace matching for method bodies, same line for abstract/interface methods
+      const isAbstract = fullMatch.trimEnd().endsWith(';');
+      const endLineNumber = isAbstract ? lineNumber : (this.findClassEndLine(content, match.index) || lineNumber);
+
       const parsedMethod: any = {
         name: methodName,
         parameters: this.parseParameters(paramString || ''),
         returnType: returnType?.trim(),
         modifiers: this.extractModifiersFromMatch(fullMatch),
         startLine: lineNumber,
-        endLine: lineNumber
+        endLine: endLineNumber
       };
 
       if (throwsClause) {

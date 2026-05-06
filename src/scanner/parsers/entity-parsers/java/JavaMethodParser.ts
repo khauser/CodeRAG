@@ -134,7 +134,27 @@ export class JavaMethodParser {
       }
     }
     
-    // 2. Find class usages: new ClassName(...), ClassName.staticMethod(), (ClassName) cast
+    // 2. Find cross-class instance method calls (field.method() or variable.method())
+    // Build a map of field/variable names to their resolved types
+    const fieldTypeMap = this.buildFieldTypeMap(content, containingClassName, imports);
+    
+    const instanceCallPattern = /(\w+)\.([a-z][A-Za-z0-9_]*)\s*\(/g;
+    while ((match = instanceCallPattern.exec(methodBody)) !== null) {
+      const receiver = match[1];
+      const calledMethod = match[2];
+      
+      if (this.isBuiltInMethod(calledMethod)) continue;
+      if (receiver === 'this' || receiver === 'super') continue;
+      
+      // Try to resolve the receiver type from field declarations
+      const resolvedType = fieldTypeMap.get(receiver);
+      if (resolvedType && !this.isStandardLibraryType(resolvedType)) {
+        const calledMethodId = `${resolvedType}.${calledMethod}`;
+        addRelationship(RelationshipBuilder.createCalls(methodId, calledMethodId, filePath));
+      }
+    }
+
+    // 3. Find class usages: new ClassName(...), ClassName.staticMethod(), (ClassName) cast
     // This helps establish coupling between classes
     const classUsagePatterns = [
       /new\s+([A-Z][A-Za-z0-9_]*)\s*[<(]/g,           // new ClassName( or new ClassName<
@@ -196,6 +216,48 @@ export class JavaMethodParser {
       'StringBuilder', 'StringBuffer', 'Throwable'
     ];
     return standardClasses.includes(className);
+  }
+
+  /**
+   * Builds a map of field/variable names to their fully qualified types.
+   * This enables cross-class CALLS edge resolution for instance method calls.
+   */
+  private buildFieldTypeMap(content: string, containingClassName: string, imports: any[]): Map<string, string> {
+    const fieldTypeMap = new Map<string, string>();
+    const containingPackage = containingClassName.substring(0, containingClassName.lastIndexOf('.'));
+    
+    // Match field declarations: [modifiers] Type fieldName [= ...];
+    // Handles generics like Map<String, List<Foo>> by using a non-greedy approach on the type
+    const fieldPattern = /(?:(?:private|protected|public|static|final|volatile|transient)\s+)*([A-Z][A-Za-z0-9_]*(?:<[^;]*?>)?)\s+([a-z][A-Za-z0-9_]*)\s*[;=]/g;
+    let match;
+    
+    while ((match = fieldPattern.exec(content)) !== null) {
+      const rawType = match[1].replace(/<.*>/, ''); // Strip generics for resolution
+      const fieldName = match[2];
+      
+      // Resolve the type through imports
+      const resolvedType = this.resolveClassName(rawType, containingPackage, imports);
+      if (resolvedType) {
+        fieldTypeMap.set(fieldName, resolvedType);
+      }
+    }
+    
+    // Also match local variable declarations in a simpler way:
+    // Type varName = expr;  or  final Type varName = expr;
+    const localVarPattern = /(?:final\s+)?([A-Z][A-Za-z0-9_]*(?:<[^;]*?>)?)\s+([a-z][A-Za-z0-9_]*)\s*=/g;
+    while ((match = localVarPattern.exec(content)) !== null) {
+      const rawType = match[1].replace(/<.*>/, '');
+      const varName = match[2];
+      
+      if (!fieldTypeMap.has(varName)) {
+        const resolvedType = this.resolveClassName(rawType, containingPackage, imports);
+        if (resolvedType) {
+          fieldTypeMap.set(varName, resolvedType);
+        }
+      }
+    }
+    
+    return fieldTypeMap;
   }
 
   private isStandardLibraryType(typeName: string): boolean {

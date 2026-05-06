@@ -12,7 +12,8 @@ jest.mock('fs');
 jest.mock('simple-git', () => ({
   simpleGit: jest.fn(() => ({
     clone: jest.fn(),
-    listRemote: jest.fn()
+    listRemote: jest.fn(),
+    addConfig: jest.fn()
   }))
 }));
 

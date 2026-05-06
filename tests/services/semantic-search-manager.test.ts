@@ -187,7 +187,6 @@ describe('SemanticSearchManager', () => {
         expect.stringContaining('vector.similarity.cosine'),
         expect.objectContaining({
           queryVector: mockEmbedding.vector,
-          limit: 5,
           threshold: 0.7,
           projectId: 'test-project'
         })

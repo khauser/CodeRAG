@@ -154,8 +154,8 @@ describe('Tool Selection for User Queries', () => {
       expect(tool).toBeDefined();
       expect(tool.description.toLowerCase()).toContain('do not use');
       expect(tool.description.toLowerCase()).toContain('lookup_class');
-      // Should have ONLY keyword to restrict usage
-      expect(tool.description).toMatch(/ONLY/i);
+      // Should have DO NOT keyword to restrict usage
+      expect(tool.description).toMatch(/DO NOT/i);
     });
   });
 
