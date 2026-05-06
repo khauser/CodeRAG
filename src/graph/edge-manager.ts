@@ -264,15 +264,17 @@ export class EdgeManager {
 
   // Complex queries for code analysis
   async findClassesThatCallMethod(methodName: string, projectId: string): Promise<string[]> {
+    // Try two strategies: direct CALLS edges, and also name-based matching
     const query = `
-      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS {project_id: $project_id}]->(method1:CodeNode {project_id: $project_id})
-      -[:CALLS {project_id: $project_id}]->(method2:CodeNode {name: $methodName, project_id: $project_id})
-      RETURN DISTINCT class.name as className
+      MATCH (caller:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS]->(m1:CodeNode {type: 'method', project_id: $project_id})
+      -[:CALLS]->(m2:CodeNode {project_id: $project_id})
+      WHERE m2.name = $methodName OR m2.qualified_name CONTAINS $methodName
+      RETURN DISTINCT caller.name as className, caller.qualified_name as qualifiedName
       ORDER BY className
     `;
     
     const result = await this.client.runQuery(query, { methodName, project_id: projectId });
-    return result.records.map(record => record.get('className'));
+    return result.records.map(record => record.get('qualifiedName') ?? record.get('className'));
   }
 
   async findClassesThatImplementInterface(interfaceName: string, projectId: string): Promise<string[]> {
@@ -292,9 +294,14 @@ export class EdgeManager {
 
   async findInheritanceHierarchy(className: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH path = (child:CodeNode {name: $className, project_id: $project_id})-[:EXTENDS* {project_id: $project_id}]->
-      (ancestor:CodeNode {project_id: $project_id})
+      MATCH (child:CodeNode {project_id: $project_id})
+      WHERE child.name = $className OR child.qualified_name = $className
+      MATCH path = (child)-[:EXTENDS*]->(ancestor:CodeNode)
+      WHERE ALL(r IN relationships(path) WHERE r.project_id = $project_id)
+        AND ALL(node IN nodes(path) WHERE node.project_id = $project_id)
       RETURN [node IN nodes(path) | node.name] as hierarchy
+      ORDER BY length(path) DESC
+      LIMIT 1
     `;
     
     const result = await this.client.runQuery(query, { className, project_id: projectId });
@@ -372,18 +379,30 @@ export class EdgeManager {
   }
 
   /**
-   * Find all classes annotated with a specific annotation
+   * Find all classes annotated with a specific annotation.
+   * Annotations may be on the class itself OR on fields/methods contained by the class.
+   * Annotation names are stored with '@' prefix (e.g., "@Inject").
    */
   async findClassesAnnotatedWith(annotationName: string, projectId: string): Promise<string[]> {
+    // Normalize: ensure we search both with and without '@' prefix
+    const withAt = annotationName.startsWith('@') ? annotationName : '@' + annotationName;
+    const withoutAt = annotationName.startsWith('@') ? annotationName.substring(1) : annotationName;
+
     const query = `
-      MATCH (class:Class {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
-      (annotation:Annotation {project_id: $project_id})
-      WHERE annotation.name = $annotationName OR annotation.name = '@' + $annotationName
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[:CONTAINS]->(member:CodeNode {project_id: $project_id})
+      -[:ANNOTATED_WITH]->(annotation:CodeNode {project_id: $project_id})
+      WHERE annotation.name = $withAt OR annotation.name = $withoutAt
+      RETURN DISTINCT class.name as className, class.qualified_name as qualifiedName
+      ORDER BY className
+      UNION
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})
+      -[:ANNOTATED_WITH]->(annotation:CodeNode {project_id: $project_id})
+      WHERE annotation.name = $withAt OR annotation.name = $withoutAt
       RETURN DISTINCT class.name as className, class.qualified_name as qualifiedName
       ORDER BY className
     `;
     
-    const result = await this.client.runQuery(query, { annotationName, project_id: projectId });
+    const result = await this.client.runQuery(query, { withAt, withoutAt, project_id: projectId });
     return result.records.map(record => record.get('qualifiedName') || record.get('className'));
   }
 
@@ -391,27 +410,34 @@ export class EdgeManager {
    * Find all methods annotated with a specific annotation
    */
   async findMethodsAnnotatedWith(annotationName: string, projectId: string): Promise<string[]> {
+    const withAt = annotationName.startsWith('@') ? annotationName : '@' + annotationName;
+    const withoutAt = annotationName.startsWith('@') ? annotationName.substring(1) : annotationName;
+
     const query = `
-      MATCH (method:Method {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
-      (annotation:Annotation {project_id: $project_id})
-      WHERE annotation.name = $annotationName OR annotation.name = '@' + $annotationName
+      MATCH (method:CodeNode {type: 'method', project_id: $project_id})-[:ANNOTATED_WITH]->
+      (annotation:CodeNode {project_id: $project_id})
+      WHERE annotation.name = $withAt OR annotation.name = $withoutAt
       RETURN DISTINCT method.name as methodName, method.qualified_name as qualifiedName
       ORDER BY methodName
     `;
     
-    const result = await this.client.runQuery(query, { annotationName, project_id: projectId });
+    const result = await this.client.runQuery(query, { withAt, withoutAt, project_id: projectId });
     return result.records.map(record => record.get('qualifiedName') || record.get('methodName'));
   }
 
   /**
-   * Find all annotations used on a specific class
+   * Find all annotations used on a specific class (directly or on its members)
    */
   async findAnnotationsOnClass(className: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH (class:Class {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
-      (annotation:Annotation {project_id: $project_id})
+      MATCH (class:CodeNode {type: 'class', project_id: $project_id})
       WHERE class.name = $className OR class.qualified_name = $className
-      RETURN DISTINCT annotation.name as annotationName
+      OPTIONAL MATCH (class)-[:ANNOTATED_WITH]->(a1:CodeNode {type: 'annotation'})
+      OPTIONAL MATCH (class)-[:CONTAINS]->(member:CodeNode)-[:ANNOTATED_WITH]->(a2:CodeNode {type: 'annotation'})
+      WITH collect(DISTINCT a1.name) + collect(DISTINCT a2.name) as allAnnotations
+      UNWIND allAnnotations as annotationName
+      WITH DISTINCT annotationName WHERE annotationName IS NOT NULL
+      RETURN annotationName
       ORDER BY annotationName
     `;
     
@@ -424,8 +450,8 @@ export class EdgeManager {
    */
   async findAnnotationsOnMethod(methodName: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH (method:Method {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
-      (annotation:Annotation {project_id: $project_id})
+      MATCH (method:CodeNode {type: 'method', project_id: $project_id})-[:ANNOTATED_WITH]->
+      (annotation:CodeNode {type: 'annotation', project_id: $project_id})
       WHERE method.name = $methodName OR method.qualified_name = $methodName
       RETURN DISTINCT annotation.name as annotationName
       ORDER BY annotationName
@@ -440,9 +466,9 @@ export class EdgeManager {
    */
   async findElementsByFrameworkAnnotation(framework: string, projectId: string): Promise<{ type: string; name: string; annotation: string }[]> {
     const query = `
-      MATCH (element:CodeNode {project_id: $project_id})-[:ANNOTATED_WITH {project_id: $project_id}]->
-      (annotation:Annotation {project_id: $project_id})
-      WHERE annotation.framework = $framework
+      MATCH (element:CodeNode {project_id: $project_id})-[:ANNOTATED_WITH]->
+      (annotation:CodeNode {type: 'annotation', project_id: $project_id})
+      WHERE annotation.attributes_json CONTAINS $framework
       RETURN element.type as type, element.name as name, element.qualified_name as qualifiedName, annotation.name as annotation
       ORDER BY element.type, element.name
     `;

@@ -108,8 +108,10 @@ export class NodeManager {
   }
 
   async findNodesByType(type: CodeNode['type'], projectId: string): Promise<CodeNode[]> {
+    // Normalize type to lowercase for consistent matching
+    const normalizedType = type.toLowerCase();
     const query = 'MATCH (n:CodeNode {type: $type, project_id: $project_id}) RETURN n ORDER BY n.name';
-    const result = await this.client.runQuery(query, { type, project_id: projectId });
+    const result = await this.client.runQuery(query, { type: normalizedType, project_id: projectId });
 
     return result.records.map(record => this.recordToNode(record.get('n')));
   }
@@ -133,9 +135,14 @@ export class NodeManager {
       MATCH (n:CodeNode {project_id: $project_id})
       WHERE n.name CONTAINS $searchTerm 
          OR n.qualified_name CONTAINS $searchTerm 
-         OR n.description CONTAINS $searchTerm
+         OR (n.description IS NOT NULL AND n.description CONTAINS $searchTerm)
       RETURN n
-      ORDER BY n.name
+      ORDER BY 
+        CASE WHEN n.name = $searchTerm THEN 0
+             WHEN n.name STARTS WITH $searchTerm THEN 1
+             WHEN n.name CONTAINS $searchTerm THEN 2
+             ELSE 3 END,
+        n.name
       LIMIT 100
     `;
 

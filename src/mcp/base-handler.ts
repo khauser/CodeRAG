@@ -65,6 +65,15 @@ export abstract class BaseHandler {
   protected embeddingService: EmbeddingService;
   protected detailLevel: 'simple' | 'detailed' = 'detailed';
 
+  /**
+   * Resolves a user-provided project identifier to the actual project_id in the database.
+   * E.g., "icm-as" → "intershop-com/Products-icm-as"
+   */
+  protected async resolveProject(userProject: string | undefined): Promise<string> {
+    if (!userProject) return '';
+    return this.client.resolveProjectId(userProject);
+  }
+
   constructor(
     protected client: Neo4jClient,
     serverName: string = 'coderag-mcp-server',
@@ -1049,27 +1058,68 @@ export abstract class BaseHandler {
 
   // Tool handler methods
   protected async handleAddNode(args: any) {
-    return await addNode(this.nodeManager, args as AddNodeParams);
+    const params: AddNodeParams = {
+      id: args?.id,
+      project: args?.project,
+      type: args?.type,
+      name: args?.name,
+      qualified_name: args?.qualified_name,
+      description: args?.description,
+      source_file: args?.source_file,
+      start_line: args?.start_line,
+      end_line: args?.end_line,
+      modifiers: args?.modifiers,
+      attributes: args?.attributes
+    };
+    return await addNode(this.nodeManager, params);
   }
 
   protected async handleUpdateNode(args: any) {
-    return await updateNode(this.nodeManager, args as UpdateNodeParams);
+    const params: UpdateNodeParams = {
+      id: args?.id,
+      project: args?.project,
+      updates: args?.updates
+    };
+    return await updateNode(this.nodeManager, params);
   }
 
   protected async handleGetNode(args: any) {
-    return await getNode(this.nodeManager, args as GetNodeParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: GetNodeParams = {
+      nodeId: args?.id ?? args?.nodeId,
+      projectId
+    };
+    return await getNode(this.nodeManager, params);
   }
 
   protected async handleDeleteNode(args: any) {
-    return await deleteNode(this.nodeManager, args as DeleteNodeParams);
+    const params: DeleteNodeParams = {
+      id: args?.id,
+      project: args?.project
+    };
+    return await deleteNode(this.nodeManager, params);
   }
 
   protected async handleFindNodesByType(args: any) {
-    return await findNodesByType(this.nodeManager, args as FindNodesByTypeParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: FindNodesByTypeParams = {
+      nodeType: args?.type ?? args?.nodeType,
+      projectId,
+      limit: args?.limit,
+      offset: args?.offset
+    };
+    return await findNodesByType(this.nodeManager, params);
   }
 
   protected async handleSearchNodes(args: any) {
-    return await searchNodes(this.nodeManager, args as SearchNodesParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: SearchNodesParams = {
+      searchTerm: args?.search_term ?? args?.searchTerm,
+      projectId,
+      limit: args?.limit,
+      offset: args?.offset
+    };
+    return await searchNodes(this.nodeManager, params);
   }
 
   protected async handleAddEdge(args: any) {
@@ -1085,27 +1135,50 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindEdgesBySource(args: any) {
-    return await findEdgesBySource(this.edgeManager, args as FindEdgesBySourceParams);
+    const project = await this.resolveProject(args?.project);
+    const params: FindEdgesBySourceParams = {
+      sourceId: args?.source_id ?? args?.sourceId,
+      project
+    };
+    return await findEdgesBySource(this.edgeManager, params);
   }
 
   protected async handleFindClassesCallingMethod(args: any) {
-    return await findMethodCallers(this.edgeManager, args as FindMethodCallersParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: FindMethodCallersParams = {
+      methodName: args?.method_name ?? args?.methodName,
+      projectId
+    };
+    return await findMethodCallers(this.edgeManager, params);
   }
 
   protected async handleFindClassesImplementingInterface(args: any) {
-    return await findImplementations(this.edgeManager, args as FindImplementationsParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: FindImplementationsParams = {
+      interfaceName: args?.interface_name ?? args?.interfaceName,
+      projectId
+    };
+    return await findImplementations(this.edgeManager, params);
   }
 
   protected async handleGetInheritanceHierarchy(args: any) {
-    return await findInheritanceHierarchy(this.edgeManager, args as FindInheritanceHierarchyParams);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const params: FindInheritanceHierarchyParams = {
+      className: args?.class_name ?? args?.className,
+      projectId
+    };
+    return await findInheritanceHierarchy(this.edgeManager, params);
   }
 
   protected async handleCalculateCKMetrics(args: any) {
-    return await calculateCKMetrics(this.metricsManager, args as CalculateCKMetricsParams, this.detailLevel);
+    const params: CalculateCKMetricsParams = {
+      classId: args?.class_id ?? args?.classId
+    };
+    return await calculateCKMetrics(this.metricsManager, params, this.detailLevel);
   }
 
   protected async handleListPackages(args: any) {
-    const projectId = args?.project;
+    const projectId = await this.resolveProject(args?.project);
     const depth = args?.depth ?? 3;
     const packages = await this.metricsManager.listPackages(projectId, depth);
     return {
@@ -1126,11 +1199,13 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindArchitecturalIssues(args: any) {
-    return await findArchitecturalIssues(this.metricsManager, args);
+    const project = await this.resolveProject(args?.project);
+    return await findArchitecturalIssues(this.metricsManager, { ...args, project });
   }
 
   protected async handleGetProjectSummary(args: any) {
-    return await getProjectSummary(this.metricsManager, args as GetProjectSummaryParams, this.detailLevel);
+    const project = args?.project ? await this.resolveProject(args.project) : undefined;
+    return await getProjectSummary(this.metricsManager, { ...args, project } as GetProjectSummaryParams, this.detailLevel);
   }
 
   protected async handleAddFile(args: any) {
@@ -1301,7 +1376,8 @@ What aspect of inheritance would you like to explore first?`;
 
   // Annotation analysis handler methods
   protected async handleFindNodesByAnnotation(args: any) {
-    const result = await findNodesByAnnotation(this.client, args);
+    const project = await this.resolveProject(args?.project);
+    const result = await findNodesByAnnotation(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };

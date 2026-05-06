@@ -271,4 +271,55 @@ describe('Neo4jClient', () => {
       expect(parsed.entityId).toBe('namespace:class:method');
     });
   });
+
+  describe('resolveProjectId', () => {
+    it('should return exact match immediately', async () => {
+      await client.connect();
+      mockSession.run.mockResolvedValueOnce({
+        records: [{ get: () => 'my-project' }]
+      });
+
+      const resolved = await client.resolveProjectId('my-project');
+      expect(resolved).toBe('my-project');
+    });
+
+    it('should resolve suffix match when exact match fails', async () => {
+      await client.connect();
+      // First call: exact match fails
+      mockSession.run.mockResolvedValueOnce({ records: [] });
+      // Second call: list all project IDs
+      mockSession.run.mockResolvedValueOnce({
+        records: [
+          { get: () => 'org/repo-my-project' },
+          { get: () => 'other/something-else' }
+        ]
+      });
+
+      const resolved = await client.resolveProjectId('my-project');
+      expect(resolved).toBe('org/repo-my-project');
+    });
+
+    it('should return input as-is when no match found', async () => {
+      await client.connect();
+      mockSession.run.mockResolvedValueOnce({ records: [] });
+      mockSession.run.mockResolvedValueOnce({ records: [] });
+
+      const resolved = await client.resolveProjectId('unknown');
+      expect(resolved).toBe('unknown');
+    });
+
+    it('should use cache on second call', async () => {
+      await client.connect();
+      mockSession.run.mockResolvedValueOnce({
+        records: [{ get: () => 'cached-project' }]
+      });
+
+      await client.resolveProjectId('cached-project');
+      // Second call - should NOT trigger another DB query
+      const callCount = mockSession.run.mock.calls.length;
+      const resolved = await client.resolveProjectId('cached-project');
+      expect(resolved).toBe('cached-project');
+      expect(mockSession.run.mock.calls.length).toBe(callCount);
+    });
+  });
 });

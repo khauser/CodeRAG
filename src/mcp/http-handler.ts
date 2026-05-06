@@ -84,11 +84,12 @@ export class HTTPHandler {
       'find_nodes_by_type',
       'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name.',
       {
-        nodeType: z.enum(['Class', 'Interface', 'Enum', 'Exception', 'Method', 'Function', 'Field', 'Package', 'Module']),
-        projectId: z.string()
+        nodeType: z.enum(['class', 'interface', 'enum', 'exception', 'method', 'function', 'field', 'package', 'module']).describe('Type of code entity (lowercase)'),
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ nodeType, projectId }) => {
-        const nodes = await this.nodeManager.findNodesByType(nodeType as any, projectId);
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const nodes = await this.nodeManager.findNodesByType(nodeType as any, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -104,10 +105,11 @@ export class HTTPHandler {
       'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. Examples: "find method validate", "search for interface Repository".',
       {
         searchTerm: z.string(),
-        projectId: z.string()
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ searchTerm, projectId }) => {
-        const nodes = await this.nodeManager.searchNodes(searchTerm, projectId);
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const nodes = await this.nodeManager.searchNodes(searchTerm, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -123,10 +125,11 @@ export class HTTPHandler {
       'Get detailed information about a specific code entity by its unique ID. Use this after search_nodes to get full details about a class, method, or other entity.',
       {
         nodeId: z.string(),
-        projectId: z.string()
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ nodeId, projectId }) => {
-        const node = await this.nodeManager.getNode(nodeId, projectId);
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const node = await this.nodeManager.getNode(nodeId, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -142,10 +145,11 @@ export class HTTPHandler {
       'Get the full ancestor chain for a class by traversing EXTENDS edges upward (child → parent → grandparent). Returns all superclasses up to the root.',
       {
         className: z.string(),
-        projectId: z.string()
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ className, projectId }) => {
-        const hierarchy = await this.edgeManager.findInheritanceHierarchy(className, projectId);
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const hierarchy = await this.edgeManager.findInheritanceHierarchy(className, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -161,10 +165,11 @@ export class HTTPHandler {
       'Find all classes that implement an interface OR extend an abstract class. Searches both IMPLEMENTS and EXTENDS edges, and uses the is_abstract flag to correctly handle abstract class hierarchies.',
       {
         interfaceName: z.string(),
-        projectId: z.string()
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ interfaceName, projectId }) => {
-        const implementations = await this.edgeManager.findClassesThatImplementInterface(interfaceName, projectId);
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const implementations = await this.edgeManager.findClassesThatImplementInterface(interfaceName, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -177,13 +182,15 @@ export class HTTPHandler {
     // Tool: Find method callers
     server.tool(
       'find_method_callers',
-      'Find all classes that call a specific method.',
+      'Find all classes that call a specific method. Optionally filter by the class that declares the method.',
       {
-        methodName: z.string(),
-        projectId: z.string()
+        methodName: z.string().describe('Method name to search for callers of'),
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        className: z.string().optional().describe('Optional: Class that declares the method (for disambiguation)')
       },
-      async ({ methodName, projectId }) => {
-        const callers = await this.edgeManager.findClassesThatCallMethod(methodName, projectId);
+      async ({ methodName, projectId, className }) => {
+        const resolvedProject = await this.client.resolveProjectId(projectId);
+        const callers = await this.edgeManager.findClassesThatCallMethod(methodName, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -216,11 +223,12 @@ export class HTTPHandler {
       'list_packages',
       'List all packages found in a project, derived from qualified class names. Call this first to discover valid package names before calling calculate_package_metrics.',
       {
-        projectId: z.string().optional().describe('Project ID to scope the operation to'),
+        projectId: z.string().optional().describe('Project ID to scope the operation to (e.g., "icm-as")'),
         depth: z.number().optional().describe('Package depth to group by (default: 3, e.g. com.example.module)')
       },
       async ({ projectId, depth }) => {
-        const packages = await this.metricsManager.listPackages(projectId, depth ?? 3);
+        const resolvedProject = projectId ? await this.client.resolveProjectId(projectId) : undefined;
+        const packages = await this.metricsManager.listPackages(resolvedProject, depth ?? 3);
         return {
           content: [{
             type: 'text',
@@ -439,11 +447,12 @@ export class HTTPHandler {
       'find_edges_by_source',
       'Find all outgoing relationships from a node. Edge types: calls (method→method), implements (class→interface), extends (class→class), contains (class→method/field), references (class→class), throws (method→exception), belongs_to (method→class).',
       {
-        project: z.string(),
+        project: z.string().describe('Project identifier (e.g., "icm-as")'),
         sourceId: z.string()
       },
       async ({ project, sourceId }) => {
-        const result = await this.edgeManager.findEdgesBySource(sourceId, project);
+        const resolvedProject = await this.client.resolveProjectId(project);
+        const result = await this.edgeManager.findEdgesBySource(sourceId, resolvedProject);
         return {
           content: [{
             type: 'text',
@@ -458,9 +467,10 @@ export class HTTPHandler {
       'get_project_summary',
       'Get overall project metrics summary and quality assessment.',
       {
-        project: z.string().optional()
+        project: z.string().optional().describe('Project identifier (e.g., "icm-as")')
       },
       async ({ project }) => {
+        const resolvedProject = project ? await this.client.resolveProjectId(project) : undefined;
         const result = await this.metricsManager.calculateProjectSummary();
         return {
           content: [{
@@ -522,15 +532,16 @@ export class HTTPHandler {
       'find_nodes_by_annotation',
       'Find code nodes (classes, methods, etc.) that have specific annotations/decorators.',
       {
-        project: z.string(),
+        project: z.string().describe('Project identifier (e.g., "icm-as")'),
         annotation_name: z.string(),
         framework: z.string().optional(),
         category: z.string().optional(),
         node_type: z.enum(['class', 'interface', 'enum', 'exception', 'function', 'method', 'field', 'package', 'module']).optional()
       },
       async (args) => {
+        const resolvedProject = await this.client.resolveProjectId(args.project);
         const { findNodesByAnnotation } = await import('./tools/find-nodes-by-annotation.js');
-        const result = await findNodesByAnnotation(this.client, args);
+        const result = await findNodesByAnnotation(this.client, { ...args, project: resolvedProject });
         return {
           content: [{
             type: 'text',

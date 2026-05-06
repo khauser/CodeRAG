@@ -4,6 +4,7 @@ import { Neo4jConfig, ProjectConfig, ProjectContext } from '../types.js';
 export class Neo4jClient {
   private driver: Driver | null = null;
   private projectConfig: ProjectConfig;
+  private projectIdCache: Map<string, string> = new Map();
 
   constructor(private config: Neo4jConfig, projectConfig?: ProjectConfig) {
     this.projectConfig = projectConfig || {
@@ -72,6 +73,61 @@ export class Neo4jClient {
       console.error('Health check failed:', error);
       return false;
     }
+  }
+
+  /**
+   * Resolves a user-provided project identifier to the actual project_id stored in the database.
+   * Supports exact match, suffix match (e.g., "icm-as" matches "intershop-com/Products-icm-as"),
+   * and case-insensitive partial match.
+   * Results are cached for performance.
+   */
+  async resolveProjectId(userInput: string): Promise<string> {
+    if (!userInput) return userInput;
+
+    // Check cache first
+    if (this.projectIdCache.has(userInput)) {
+      return this.projectIdCache.get(userInput)!;
+    }
+
+    // Try exact match first
+    const exactResult = await this.runQuery(
+      'MATCH (n:CodeNode {project_id: $pid}) RETURN n.project_id as pid LIMIT 1',
+      { pid: userInput }
+    );
+    if (exactResult.records.length > 0) {
+      this.projectIdCache.set(userInput, userInput);
+      return userInput;
+    }
+
+    // Try suffix/contains match against known project IDs
+    const allProjects = await this.runQuery(
+      'MATCH (n:CodeNode) RETURN DISTINCT n.project_id as pid'
+    );
+    
+    const allProjectIds = allProjects.records.map(r => r.get('pid') as string);
+    
+    // Strategy 1: ends with the user input (e.g., "icm-as" matches "intershop-com/Products-icm-as")
+    const suffixMatch = allProjectIds.find(pid => 
+      pid.endsWith(userInput) || pid.endsWith('/' + userInput) || pid.endsWith('-' + userInput)
+    );
+    if (suffixMatch) {
+      this.projectIdCache.set(userInput, suffixMatch);
+      return suffixMatch;
+    }
+
+    // Strategy 2: contains the user input (case-insensitive)
+    const lowerInput = userInput.toLowerCase();
+    const containsMatch = allProjectIds.find(pid => 
+      pid.toLowerCase().includes(lowerInput)
+    );
+    if (containsMatch) {
+      this.projectIdCache.set(userInput, containsMatch);
+      return containsMatch;
+    }
+
+    // No match found — return as-is (will likely result in empty results)
+    this.projectIdCache.set(userInput, userInput);
+    return userInput;
   }
 
   async initializeDatabase(): Promise<void> {
