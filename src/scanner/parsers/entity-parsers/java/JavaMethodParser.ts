@@ -79,17 +79,25 @@ export class JavaMethodParser {
   }
 
   private findContainingClass(content: string, methodLine: number, entities: ParsedEntity[]): ParsedEntity | null {
-    // Find the class that contains this method based on line numbers
+    // Find the class or interface that contains this method based on line numbers
+    let bestMatch: ParsedEntity | null = null;
+    let bestRange = Infinity;
+
     for (const entity of entities) {
-      if (entity.type === 'class' && 
+      if ((entity.type === 'class' || entity.type === 'interface') && 
           entity.start_line && 
           entity.end_line &&
           methodLine >= entity.start_line && 
           methodLine <= entity.end_line) {
-        return entity;
+        // Prefer the narrowest enclosing entity (handles nested classes)
+        const range = entity.end_line - entity.start_line;
+        if (range < bestRange) {
+          bestRange = range;
+          bestMatch = entity;
+        }
       }
     }
-    return null;
+    return bestMatch;
   }
 
   private parseMethodCalls(
@@ -253,6 +261,36 @@ export class JavaMethodParser {
         const resolvedType = this.resolveClassName(rawType, containingPackage, imports);
         if (resolvedType) {
           fieldTypeMap.set(varName, resolvedType);
+        }
+      }
+    }
+    
+    // Match method parameters: (Type paramName, Type paramName, ...)
+    // This captures parameters from method signatures so calls like param.method() can be resolved
+    const methodParamPattern = /\(\s*(?:(?:final\s+)?(?:@\w+(?:\([^)]*\))?\s+)*([A-Z][A-Za-z0-9_]*(?:<[^>]*>)?)\s+([a-z][A-Za-z0-9_]*)\s*[,)])/g;
+    while ((match = methodParamPattern.exec(content)) !== null) {
+      const rawType = match[1].replace(/<.*>/, '');
+      const paramName = match[2];
+      
+      if (!fieldTypeMap.has(paramName)) {
+        const resolvedType = this.resolveClassName(rawType, containingPackage, imports);
+        if (resolvedType) {
+          fieldTypeMap.set(paramName, resolvedType);
+        }
+      }
+    }
+
+    // Match all method parameters more broadly: handles multi-param signatures
+    // Pattern: Type name appearing in parameter lists
+    const allParamsPattern = /(?:final\s+)?(?:@\w+(?:\([^)]*\))?\s+)*([A-Z][A-Za-z0-9_]*(?:<[^>]*>)?)\s+([a-z][A-Za-z0-9_]*)\s*(?=[,)])/g;
+    while ((match = allParamsPattern.exec(content)) !== null) {
+      const rawType = match[1].replace(/<.*>/, '');
+      const paramName = match[2];
+      
+      if (!fieldTypeMap.has(paramName)) {
+        const resolvedType = this.resolveClassName(rawType, containingPackage, imports);
+        if (resolvedType) {
+          fieldTypeMap.set(paramName, resolvedType);
         }
       }
     }

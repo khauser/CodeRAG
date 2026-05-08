@@ -96,7 +96,7 @@ export function getSemanticSearchConfig(): SemanticSearchConfig {
     api_key,
     base_url,
     dimensions: parseInt(process.env.EMBEDDING_DIMENSIONS || defaultDimensions.toString(), 10),
-    max_tokens: parseInt(process.env.EMBEDDING_MAX_TOKENS || '8000', 10),
+    max_tokens: parseInt(process.env.EMBEDDING_MAX_TOKENS || '2000', 10),
     batch_size: parseInt(process.env.EMBEDDING_BATCH_SIZE || defaultBatchSize.toString(), 10),
     similarity_threshold: parseFloat(process.env.SIMILARITY_THRESHOLD || '0.7'),
     parallel_requests: parseInt(process.env.EMBEDDING_PARALLEL_REQUESTS || '10', 10),

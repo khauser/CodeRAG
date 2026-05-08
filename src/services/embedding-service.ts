@@ -134,29 +134,60 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
-    try {
-      const truncatedText = this.truncateText(text, this.config.max_tokens);
-      
-      const response = await fetch(`${this.baseUrl}/api/embeddings`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.config.model,
-          prompt: truncatedText,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      return data.embedding;
-    } catch (error) {
-      throw new Error(`Failed to generate Ollama embedding: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    if (!text || text.trim().length === 0) {
+      throw new Error('Empty text provided for embedding generation');
     }
+
+    // Replace null bytes, control characters, and non-BMP Unicode (surrogate pairs) that may cause Ollama issues
+    const sanitizedText = text
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+      .replace(/[\uD800-\uDFFF]/g, '')
+      .replace(/[\uFFFD\uFFFE\uFFFF]/g, '');
+    const truncatedText = this.truncateText(sanitizedText, this.config.max_tokens);
+    const maxRetries = 5;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(`${this.baseUrl}/api/embeddings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.config.model,
+            prompt: truncatedText,
+          }),
+        });
+
+        if (!response.ok) {
+          let errorBody = '';
+          try { errorBody = await response.text(); } catch { /* ignore */ }
+          const statusText = `${response.status} ${response.statusText}`;
+          // Don't retry on deterministic errors like context length exceeded
+          const isRetryable = response.status >= 500 && !errorBody.includes('context length');
+          if (isRetryable && attempt < maxRetries) {
+            const delay = Math.pow(2, attempt) * 2000;
+            console.warn(`Ollama API error (${statusText}): ${errorBody.substring(0, 200)}, retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          throw new Error(`Ollama API error: ${statusText} - ${errorBody.substring(0, 500)}`);
+        }
+
+        const data = await response.json();
+        return data.embedding;
+      } catch (error) {
+        if (attempt < maxRetries && error instanceof Error && !error.message.startsWith('Ollama API error:')) {
+          const delay = Math.pow(2, attempt) * 2000;
+          console.warn(`Ollama request failed, retrying in ${delay}ms (attempt ${attempt}/${maxRetries}): ${error.message}`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw new Error(`Failed to generate Ollama embedding: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+
+    throw new Error('Failed to generate Ollama embedding: max retries exceeded');
   }
 
   async generateEmbeddings(texts: string[]): Promise<number[][]> {
@@ -171,7 +202,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
           this.generateEmbedding(text)
             .then(embedding => ({ index: i + idx, embedding }))
             .catch(error => {
-              console.warn(`Failed to generate embedding for text at index ${i + idx}:`, error);
+              console.warn(`Failed to generate embedding for text at index ${i + idx} (length=${text?.length}, first 200 chars: ${JSON.stringify(text?.substring(0, 200))}):`, error);
               return { index: i + idx, embedding: null as number[] | null };
             })
         );

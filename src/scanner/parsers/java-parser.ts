@@ -77,6 +77,11 @@ export class JavaParser extends BaseLanguageParser {
         (rel) => this.addRelationship(relationships, rel)
       );
 
+      // Parse interfaces and enums BEFORE methods so that findContainingClass
+      // can resolve methods declared inside interfaces
+      this.parseInterfaces(content, filePath, packageName, entities, relationships);
+      this.parseEnums(content, filePath, packageName, entities, relationships);
+
       this.methodParser.parseMethods(
         content, filePath, packageName, entities, relationships,
         (entity) => this.addEntity(entities, entity),
@@ -88,10 +93,6 @@ export class JavaParser extends BaseLanguageParser {
         (entity) => this.addEntity(entities, entity),
         (rel) => this.addRelationship(relationships, rel)
       );
-
-      // Parse interfaces and enums using content extractor
-      this.parseInterfaces(content, filePath, packageName, entities, relationships);
-      this.parseEnums(content, filePath, packageName, entities, relationships);
 
     } catch (error) {
       this.addError(errors, {

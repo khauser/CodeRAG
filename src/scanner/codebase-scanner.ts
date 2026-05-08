@@ -92,61 +92,92 @@ export class CodebaseScanner {
     // Ensure project exists in database
     await this.ensureProjectExists(actualConfig);
     
-    const allEntities: ParsedEntity[] = [];
-    const allRelationships: ParsedRelationship[] = [];
     const allErrors: any[] = [];
     let filesProcessed = 0;
+    let totalEntities = 0;
+    let totalRelationships = 0;
 
     try {
       // Find all source files
       const files = await this.findSourceFiles(actualConfig);
       console.log(`📁 Found ${files.length} source files`);
 
-      // Process files in batches
-      const batchSize = 10;
-      for (let i = 0; i < files.length; i += batchSize) {
-        const batch = files.slice(i, i + batchSize);
+      // Process and store files in streaming batches to avoid heap overflow
+      const fileBatchSize = 10;
+      const storeBatchSize = 500; // Store to DB every N files
+      let pendingEntities: ParsedEntity[] = [];
+      let pendingRelationships: ParsedRelationship[] = [];
+
+      for (let i = 0; i < files.length; i += fileBatchSize) {
+        const batch = files.slice(i, i + fileBatchSize);
         const batchResults = await Promise.all(
           batch.map(file => this.processFile(file, actualConfig))
         );
 
         for (const result of batchResults) {
           if (result) {
-            allEntities.push(...result.entities);
-            allRelationships.push(...result.relationships);
-            allErrors.push(...result.errors);
+            for (const entity of result.entities) {
+              pendingEntities.push(entity);
+            }
+            for (const rel of result.relationships) {
+              pendingRelationships.push(rel);
+            }
+            for (const err of result.errors) {
+              allErrors.push(err);
+            }
             filesProcessed++;
           }
         }
 
-        if (actualConfig.outputProgress) {
-          console.log(`📊 Processed ${Math.min(i + batchSize, files.length)}/${files.length} files`);
+        // Store incrementally to keep memory usage bounded
+        if (filesProcessed % storeBatchSize < fileBatchSize && pendingEntities.length > 0) {
+          console.log(`💾 Storing batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships (${filesProcessed}/${files.length} files)...`);
+          const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings);
+          for (const err of storeErrors) {
+            allErrors.push(err);
+          }
+          totalEntities += pendingEntities.length;
+          totalRelationships += pendingRelationships.length;
+          pendingEntities = [];
+          pendingRelationships = [];
+        }
+
+        if (actualConfig.outputProgress && i % 1000 < fileBatchSize) {
+          console.log(`📊 Processed ${Math.min(i + fileBatchSize, files.length)}/${files.length} files`);
         }
       }
 
-      // Store entities and relationships in the graph
-      console.log(`💾 Storing ${allEntities.length} entities and ${allRelationships.length} relationships...`);
-      const storeErrors = await this.storeInGraph(allEntities, allRelationships, actualConfig.skipEmbeddings);
-      allErrors.push(...storeErrors);
+      // Store remaining entities/relationships
+      if (pendingEntities.length > 0) {
+        console.log(`💾 Storing final batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships...`);
+        const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings);
+        for (const err of storeErrors) {
+          allErrors.push(err);
+        }
+        totalEntities += pendingEntities.length;
+        totalRelationships += pendingRelationships.length;
+        pendingEntities = [];
+        pendingRelationships = [];
+      }
 
       const processingTimeMs = Date.now() - startTime;
       
       const result: ParseResult = {
-        entities: allEntities,
-        relationships: allRelationships,
+        entities: [],
+        relationships: [],
         errors: allErrors,
         stats: {
           filesProcessed,
-          entitiesFound: allEntities.length,
-          relationshipsFound: allRelationships.length,
+          entitiesFound: totalEntities,
+          relationshipsFound: totalRelationships,
           processingTimeMs
         }
       };
 
       console.log(`✅ Scan completed successfully!`);
       console.log(`   Files processed: ${filesProcessed}`);
-      console.log(`   Entities found: ${allEntities.length}`);
-      console.log(`   Relationships found: ${allRelationships.length}`);
+      console.log(`   Entities found: ${totalEntities}`);
+      console.log(`   Relationships found: ${totalRelationships}`);
       console.log(`   Processing time: ${(processingTimeMs / 1000).toFixed(2)}s`);
       
       if (allErrors.length > 0) {
@@ -171,7 +202,9 @@ export class CodebaseScanner {
   }
 
   async clearGraph(projectId?: string): Promise<void> {
-    const BATCH_SIZE = 500;
+    const BATCH_SIZE = 2000;
+
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     const deleteBatched = async (
       relQuery: string,
@@ -188,6 +221,7 @@ export class CodebaseScanner {
         batchCount++;
         if (relCount > 0) {
           console.log(`   Rel batch ${batchCount}: deleted ${relCount} relationships...`);
+          await sleep(100); // Allow Neo4j to flush WAL between batches
         }
       } while (relCount > 0);
 
@@ -200,6 +234,7 @@ export class CodebaseScanner {
         batchCount++;
         if (nodeCount > 0) {
           console.log(`   Node batch ${batchCount}: deleted ${nodeCount} nodes...`);
+          await sleep(100); // Allow Neo4j to flush WAL between batches
         }
       } while (nodeCount > 0);
 
@@ -372,7 +407,9 @@ export class CodebaseScanner {
         ignore: excludePatterns,
         absolute: true
       });
-      files.push(...matches);
+      for (const match of matches) {
+        files.push(match);
+      }
     }
 
     // Remove duplicates and sort
@@ -479,7 +516,7 @@ export class CodebaseScanner {
     
     // Store entities in batches and track successfully stored ones
     const successfullyStoredEntities: ParsedEntity[] = [];
-    const entityBatchSize = 100;
+    const entityBatchSize = 25;
     for (let i = 0; i < deduplicatedEntities.length; i += entityBatchSize) {
       const batch = deduplicatedEntities.slice(i, i + entityBatchSize);
       await Promise.all(batch.map(async (entity) => {
@@ -531,20 +568,34 @@ export class CodebaseScanner {
     // Check if relationship sources/targets exist in entities
     const entityIds = new Set(deduplicatedEntities.map(e => e.id));
 
-    // For every IMPLEMENTS edge whose interface target is not in the current
-    // scan (e.g. a framework interface shipped as a JAR), create a lightweight
-    // stub node so the edge can be stored and later queried.  We use the
-    // project_id of the implementing class as the owner.
+    // For every edge whose target is not in the current scan (e.g. a framework
+    // interface shipped as a JAR, or a method in another cartridge), create a
+    // lightweight stub node so the edge can be stored and later queried.
+    // We use the project_id of the source entity as the owner.
     const stubsToStore: ParsedEntity[] = [];
     for (const r of deduplicatedRelationships) {
-      if (r.type === 'implements' && !entityIds.has(r.target)) {
-        // Derive project_id from the source entity (the implementing class)
+      if (!entityIds.has(r.target)) {
+        // Determine stub type based on edge type
+        let stubType: 'class' | 'interface' | 'method';
+        if (r.type === 'implements' || r.type === 'extends') {
+          stubType = 'interface';
+        } else if (r.type === 'calls') {
+          stubType = 'method';
+        } else if (r.type === 'references') {
+          stubType = 'class';
+        } else {
+          // Skip other edge types (contains, belongs_to, etc.) — their targets
+          // should always be in the same scan batch
+          continue;
+        }
+
+        // Derive project_id from the source entity
         const sourceEntity = deduplicatedEntities.find(e => e.id === r.source);
         const projectId = sourceEntity?.project_id ?? r.project_id;
         const stub: ParsedEntity = {
           id: r.target,
           project_id: projectId,
-          type: 'interface',
+          type: stubType,
           name: r.target.split('.').pop() ?? r.target,
           qualified_name: r.target,
           source_file: 'external',
@@ -557,7 +608,7 @@ export class CodebaseScanner {
     }
 
     if (stubsToStore.length > 0) {
-      console.log(`📋 Creating ${stubsToStore.length} stub interface nodes for external/dependency targets`);
+      console.log(`📋 Creating ${stubsToStore.length} stub nodes for external/cross-cartridge targets`);
       for (const stub of stubsToStore) {
         try {
           await this.nodeManager.addNode({
@@ -576,7 +627,8 @@ export class CodebaseScanner {
     }
 
     // Filter out relationships where source doesn't exist.
-    // IMPLEMENTS targets are now guaranteed to exist (either scanned or stub).
+    // Targets for implements, extends, calls, and references edges are now
+    // guaranteed to exist (either scanned or stub).
     const storableRelationships = deduplicatedRelationships.filter(r => {
       if (!entityIds.has(r.source)) return false;
       if (!entityIds.has(r.target)) return false;

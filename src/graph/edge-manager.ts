@@ -50,7 +50,7 @@ export class EdgeManager {
    */
   async addEdgesBatch(
     edges: CodeEdge[],
-    batchSize = 500
+    batchSize = 100
   ): Promise<{ stored: number; errors: Array<{ edge: CodeEdge; error: string }> }> {
     if (edges.length === 0) return { stored: 0, errors: [] };
 
