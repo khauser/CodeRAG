@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import OpenAI, { AzureOpenAI } from 'openai';
 import { SemanticSearchConfig, SemanticEmbedding } from '../types.js';
 import { getSemanticSearchConfig } from '../config.js';
 
@@ -49,16 +49,46 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     
     this.config = config;
     
-    // Support custom base URLs for OpenAI-compatible APIs (e.g., LLM Studio)
-    const clientConfig: any = {
-      apiKey: config.api_key,
-    };
+    // Detect Azure OpenAI by URL pattern
+    const isAzure = config.base_url && config.base_url.includes('.openai.azure.com');
     
-    if (config.base_url) {
-      clientConfig.baseURL = config.base_url;
+    if (isAzure) {
+      // Use AzureOpenAI client for Azure endpoints.
+      // In openai SDK v5+, baseURL and endpoint are mutually exclusive.
+      // Since the SDK reads OPENAI_BASE_URL from env as default for baseURL,
+      // we must use baseURL (not endpoint) to avoid the conflict.
+      const azureEndpoint = this.extractAzureEndpoint(config.base_url!);
+      this.client = new AzureOpenAI({
+        apiKey: config.api_key,
+        baseURL: `${azureEndpoint}/openai`,
+        apiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-06-01',
+        deployment: config.model,
+      });
+    } else {
+      // Standard OpenAI or compatible API
+      const clientConfig: any = {
+        apiKey: config.api_key,
+      };
+      
+      if (config.base_url) {
+        clientConfig.baseURL = config.base_url;
+      }
+      
+      this.client = new OpenAI(clientConfig);
     }
-    
-    this.client = new OpenAI(clientConfig);
+  }
+
+  /**
+   * Extracts the Azure endpoint base URL (e.g. https://myresource.openai.azure.com)
+   * from a full base_url that may include path segments.
+   */
+  private extractAzureEndpoint(baseUrl: string): string {
+    try {
+      const url = new URL(baseUrl);
+      return `${url.protocol}//${url.host}`;
+    } catch {
+      return baseUrl;
+    }
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
