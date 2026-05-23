@@ -22,25 +22,33 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockMainResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('com.example.TestClass.testMethod')
-              .mockReturnValueOnce('method')
-              .mockReturnValueOnce('TestClass.java')
-              .mockReturnValueOnce([
-                { name: '@Test', category: 'testing', framework: 'JUnit' },
-                { name: '@BeforeEach', category: 'testing', framework: 'JUnit' }
-              ])
-              .mockReturnValueOnce(2)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'test_entity': return 'com.example.TestClass.testMethod';
+                case 'entity_type': return 'method';
+                case 'source_file': return 'TestClass.java';
+                case 'test_annotations': return [
+                  { name: '@Test', category: 'testing', framework: 'JUnit' },
+                  { name: '@BeforeEach', category: 'testing', framework: 'JUnit' }
+                ];
+                case 'annotation_count': return 2;
+                default: return null;
+              }
+            })
           },
           {
-            get: jest.fn()
-              .mockReturnValueOnce('com.example.AnotherTestClass.anotherTest')
-              .mockReturnValueOnce('method')
-              .mockReturnValueOnce('AnotherTestClass.java')
-              .mockReturnValueOnce([
-                { name: '@Test', category: 'testing', framework: 'JUnit' }
-              ])
-              .mockReturnValueOnce(1)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'test_entity': return 'com.example.AnotherTestClass.anotherTest';
+                case 'entity_type': return 'method';
+                case 'source_file': return 'AnotherTestClass.java';
+                case 'test_annotations': return [
+                  { name: '@Test', category: 'testing', framework: 'JUnit' }
+                ];
+                case 'annotation_count': return 1;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -48,13 +56,17 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockFrameworkResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('JUnit')
-              .mockReturnValueOnce([
-                { name: '@Test', count: 2 },
-                { name: '@BeforeEach', count: 1 }
-              ])
-              .mockReturnValueOnce(3)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'framework': return 'JUnit';
+                case 'annotations': return [
+                  { name: '@Test', count: 2 },
+                  { name: '@BeforeEach', count: 1 }
+                ];
+                case 'total_usage': return 3;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -86,14 +98,18 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockMainResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('com.example.TestClass.testMethod')
-              .mockReturnValueOnce('method')
-              .mockReturnValueOnce('TestClass.java')
-              .mockReturnValueOnce([
-                { name: '@Test', category: 'testing', framework: 'JUnit' }
-              ])
-              .mockReturnValueOnce(1)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'test_entity': return 'com.example.TestClass.testMethod';
+                case 'entity_type': return 'method';
+                case 'source_file': return 'TestClass.java';
+                case 'test_annotations': return [
+                  { name: '@Test', category: 'testing', framework: 'JUnit' }
+                ];
+                case 'annotation_count': return 1;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -101,12 +117,16 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockFrameworkResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('JUnit')
-              .mockReturnValueOnce([
-                { name: '@Test', count: 1 }
-              ])
-              .mockReturnValueOnce(1)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'framework': return 'JUnit';
+                case 'annotations': return [
+                  { name: '@Test', count: 1 }
+                ];
+                case 'total_usage': return 1;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -134,14 +154,18 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockMainResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('com.example.TestClass.testMethod')
-              .mockReturnValueOnce('method')
-              .mockReturnValueOnce('TestClass.java')
-              .mockReturnValueOnce([
-                { name: '@Test', category: 'testing', framework: 'JUnit' }
-              ])
-              .mockReturnValueOnce(1)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'test_entity': return 'com.example.TestClass.testMethod';
+                case 'entity_type': return 'method';
+                case 'source_file': return 'TestClass.java';
+                case 'test_annotations': return [
+                  { name: '@Test', category: 'testing', framework: 'JUnit' }
+                ];
+                case 'annotation_count': return 1;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -149,12 +173,16 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockFrameworkResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce('JUnit')
-              .mockReturnValueOnce([
-                { name: '@Test', count: 1 }
-              ])
-              .mockReturnValueOnce(1)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'framework': return 'JUnit';
+                case 'annotations': return [
+                  { name: '@Test', count: 1 }
+                ];
+                case 'total_usage': return 1;
+                default: return null;
+              }
+            })
           }
         ]
       };
@@ -162,11 +190,15 @@ describe('Analyze Testing Annotations Tools', () => {
       const mockCoverageResult = {
         records: [
           {
-            get: jest.fn()
-              .mockReturnValueOnce(10)
-              .mockReturnValueOnce(7)
-              .mockReturnValueOnce(3)
-              .mockReturnValueOnce(70)
+            get: jest.fn((field: string) => {
+              switch (field) {
+                case 'total_methods': return 10;
+                case 'methods_with_tests': return 7;
+                case 'methods_without_tests': return 3;
+                case 'coverage_percentage': return 70;
+                default: return null;
+              }
+            })
           }
         ]
       };

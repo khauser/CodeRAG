@@ -441,23 +441,38 @@ describe('OllamaEmbeddingProvider', () => {
     });
 
     it('should handle API errors', async () => {
+      jest.useFakeTimers();
       (fetch as jest.Mock).mockResolvedValue({
         ok: false,
-        status: 500,
-        statusText: 'Internal Server Error'
+        status: 400,
+        statusText: 'Bad Request',
+        text: jest.fn().mockResolvedValue('invalid request')
       });
 
       const provider = new OllamaEmbeddingProvider(mockConfig);
+      const promise = provider.generateEmbedding('test text');
 
-      await expect(provider.generateEmbedding('test text')).rejects.toThrow('Failed to generate Ollama embedding: Ollama API error: 500 Internal Server Error');
+      // 400 is non-retryable, so it should fail immediately
+      await expect(promise).rejects.toThrow(/Failed to generate Ollama embedding: Ollama API error: 400 Bad Request/);
+      jest.useRealTimers();
     });
 
     it('should handle network errors', async () => {
+      jest.useFakeTimers();
       (fetch as jest.Mock).mockRejectedValue(new Error('Network error'));
 
       const provider = new OllamaEmbeddingProvider(mockConfig);
+      const promise = provider.generateEmbedding('test text').catch(e => e);
 
-      await expect(provider.generateEmbedding('test text')).rejects.toThrow('Failed to generate Ollama embedding: Network error');
+      // Advance through all retry delays
+      for (let i = 0; i < 5; i++) {
+        await jest.advanceTimersByTimeAsync(100000);
+      }
+
+      const error = await promise;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe('Failed to generate Ollama embedding: Network error');
+      jest.useRealTimers();
     });
 
     it('should truncate long text', async () => {
@@ -531,6 +546,7 @@ describe('OllamaEmbeddingProvider', () => {
     });
 
     it('should handle batch errors gracefully', async () => {
+      jest.useFakeTimers();
       (fetch as jest.Mock).mockRejectedValue(new Error('Network error'));
 
       const provider = new OllamaEmbeddingProvider(mockConfig);
@@ -538,8 +554,16 @@ describe('OllamaEmbeddingProvider', () => {
 
       // The implementation catches individual errors and returns empty array
       // rather than throwing, which is the graceful error handling behavior
-      const result = await provider.generateEmbeddings(texts);
+      const promise = provider.generateEmbeddings(texts);
+
+      // Advance through all retry delays
+      for (let i = 0; i < 5; i++) {
+        await jest.advanceTimersByTimeAsync(100000);
+      }
+
+      const result = await promise;
       expect(result).toEqual([]);
+      jest.useRealTimers();
     });
   });
 });
