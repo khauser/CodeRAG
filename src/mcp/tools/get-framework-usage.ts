@@ -16,6 +16,7 @@ export async function getFrameworkUsage(
     WHERE n.attributes IS NOT NULL 
     AND n.attributes.annotations IS NOT NULL
     UNWIND n.attributes.annotations as annotation
+    WITH n, annotation
     WHERE annotation.framework IS NOT NULL
     WITH annotation.framework as framework,
          annotation.name as annotation_name,

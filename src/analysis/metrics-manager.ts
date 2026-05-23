@@ -165,7 +165,8 @@ export class MetricsManager {
       WITH class, collect(DISTINCT other) as outgoing
       OPTIONAL MATCH (class)<-[:EXTENDS|IMPLEMENTS|REFERENCES]-(incoming:CodeNode)
       WHERE incoming.type IN ['class', 'interface'] AND incoming.id <> $classId
-      RETURN size(outgoing) + size(collect(DISTINCT incoming)) as cbo
+      WITH outgoing, collect(DISTINCT incoming) as incoming
+      RETURN size(outgoing) + size(incoming) as cbo
     `;
     const result = await this.client.runQuery(query, { classId });
     return result.records[0]?.get('cbo').toNumber() || 0;

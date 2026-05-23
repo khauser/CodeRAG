@@ -18,6 +18,7 @@ export async function getAnnotationUsage(
     WHERE n.attributes IS NOT NULL 
     AND n.attributes.annotations IS NOT NULL
     UNWIND n.attributes.annotations as annotation
+    WITH n, annotation
     WHERE annotation.name IS NOT NULL
   `;
   

@@ -45,13 +45,16 @@ export async function analyzeTestingAnnotations(
   
   const result = await neo4jClient.runQuery(query, queryParams);
   
-  const testEntities = result.records?.map(record => ({
-    test_entity: record.get('test_entity'),
-    entity_type: record.get('entity_type'),
-    source_file: record.get('source_file'),
-    test_annotations: record.get('test_annotations'),
-    annotation_count: record.get('annotation_count')
-  })) || [];
+  const testEntities = result.records?.map(record => {
+    const annotationCount = record.get('annotation_count');
+    return {
+      test_entity: record.get('test_entity'),
+      entity_type: record.get('entity_type'),
+      source_file: record.get('source_file'),
+      test_annotations: record.get('test_annotations'),
+      annotation_count: typeof annotationCount === 'object' && annotationCount.toNumber ? annotationCount.toNumber() : Number(annotationCount)
+    };
+  }) || [];
   
   // Get testing framework statistics
   const frameworkStatsQuery = `
@@ -60,8 +63,7 @@ export async function analyzeTestingAnnotations(
     AND n.attributes.annotations IS NOT NULL
     AND any(annotation IN n.attributes.annotations 
          WHERE annotation.category = 'testing')
-    UNWIND n.attributes.annotations as annotation
-    WHERE annotation.category = 'testing'
+    UNWIND [a IN n.attributes.annotations WHERE a.category = 'testing'] as annotation
     WITH annotation.framework as framework,
          annotation.name as annotation_name,
          count(*) as usage_count
@@ -73,11 +75,14 @@ export async function analyzeTestingAnnotations(
   `;
   
   const frameworkResult = await neo4jClient.runQuery(frameworkStatsQuery);
-  const frameworkStats = frameworkResult.records?.map(record => ({
-    framework: record.get('framework'),
-    annotations: record.get('annotations'),
-    total_usage: record.get('total_usage')
-  })) || [];
+  const frameworkStats = frameworkResult.records?.map(record => {
+    const totalUsage = record.get('total_usage');
+    return {
+      framework: record.get('framework'),
+      annotations: record.get('annotations'),
+      total_usage: typeof totalUsage === 'object' && totalUsage.toNumber ? totalUsage.toNumber() : Number(totalUsage)
+    };
+  }) || [];
   
   let coverageAnalysis = null;
   
@@ -113,11 +118,12 @@ export async function analyzeTestingAnnotations(
     const coverageRecord = coverageResult.records?.[0];
     
     if (coverageRecord) {
+      const toNum = (val: any) => typeof val === 'object' && val.toNumber ? val.toNumber() : Number(val);
       coverageAnalysis = {
-        total_methods: coverageRecord.get('total_methods'),
-        methods_with_tests: coverageRecord.get('methods_with_tests'),
-        methods_without_tests: coverageRecord.get('methods_without_tests'),
-        coverage_percentage: coverageRecord.get('coverage_percentage')
+        total_methods: toNum(coverageRecord.get('total_methods')),
+        methods_with_tests: toNum(coverageRecord.get('methods_with_tests')),
+        methods_without_tests: toNum(coverageRecord.get('methods_without_tests')),
+        coverage_percentage: toNum(coverageRecord.get('coverage_percentage'))
       };
     }
   }
@@ -169,13 +175,18 @@ export async function findUntestableCode(neo4jClient: Neo4jClient, params: { pro
   
   const result = await neo4jClient.runQuery(query, { project });
   
-  return {
-    testability_issues: result.records?.map(record => ({
+  const testabilityIssues = result.records?.map(record => {
+    const count = record.get('count');
+    return {
       concern: record.get('testability_concern'),
       methods: record.get('methods'),
-      count: record.get('count')
-    })) || [],
-    total_concerning_methods: result.records?.reduce((sum, record) => sum + record.get('count'), 0) || 0
+      count: typeof count === 'object' && count.toNumber ? count.toNumber() : Number(count)
+    };
+  }) || [];
+
+  return {
+    testability_issues: testabilityIssues,
+    total_concerning_methods: testabilityIssues.reduce((sum, issue) => sum + issue.count, 0)
   };
 }
 
