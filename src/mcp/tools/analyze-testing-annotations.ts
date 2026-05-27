@@ -12,28 +12,25 @@ export async function analyzeTestingAnnotations(
 ) {
   const { project, framework, include_coverage_analysis = false } = params;
   
+  // Use ANNOTATED_WITH edges and annotation node attributes (category stored in attributes_json)
   let query = `
-    MATCH (n)
+    MATCH (n:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
     WHERE n.project_id = $project
-    AND n.attributes IS NOT NULL 
-    AND n.attributes.annotations IS NOT NULL
-    AND any(annotation IN n.attributes.annotations 
-         WHERE annotation.category = 'testing'
+    AND a.attributes_json IS NOT NULL
+    WITH n, a, apoc.convert.fromJsonMap(a.attributes_json) AS attrs
+    WHERE attrs.category = 'testing'
   `;
   
   const queryParams: any = { project };
   
   if (framework) {
-    query += ` AND annotation.framework = $framework`;
+    query += ` AND attrs.framework = $framework`;
     queryParams.framework = framework;
   }
   
-  query += ')';
-  
   query += `
     WITH n,
-         [annotation IN n.attributes.annotations 
-          WHERE annotation.category = 'testing'] as test_annotations
+         collect({name: a.name, framework: attrs.framework, category: attrs.category}) as test_annotations
     
     RETURN n.qualified_name as test_entity,
            n.type as entity_type,
@@ -58,16 +55,13 @@ export async function analyzeTestingAnnotations(
   
   // Get testing framework statistics
   const frameworkStatsQuery = `
-    MATCH (n)
-    WHERE n.attributes IS NOT NULL 
-    AND n.attributes.annotations IS NOT NULL
-    AND any(annotation IN n.attributes.annotations 
-         WHERE annotation.category = 'testing')
-    UNWIND [a IN n.attributes.annotations WHERE a.category = 'testing'] as annotation
-    WITH annotation.framework as framework,
-         annotation.name as annotation_name,
-         count(*) as usage_count
-    WHERE framework IS NOT NULL
+    MATCH (n:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+    WHERE a.attributes_json IS NOT NULL
+    WITH n, a, apoc.convert.fromJsonMap(a.attributes_json) AS attrs
+    WHERE attrs.category = 'testing' AND attrs.framework IS NOT NULL
+    WITH attrs.framework as framework,
+         a.name as annotation_name,
+         count(DISTINCT n) as usage_count
     RETURN framework,
            collect({name: annotation_name, count: usage_count}) as annotations,
            sum(usage_count) as total_usage
@@ -89,19 +83,23 @@ export async function analyzeTestingAnnotations(
   if (include_coverage_analysis) {
     // Analyze test coverage by looking for non-test methods without corresponding test methods
     const coverageQuery = `
-      MATCH (method)
+      MATCH (method:CodeNode)
       WHERE method.project_id = $project
       AND method.type = 'method'
-      AND NOT any(annotation IN coalesce(method.attributes.annotations, []) 
-                  WHERE annotation.category = 'testing')
       AND NOT method.qualified_name CONTAINS 'test'
       AND NOT method.qualified_name CONTAINS 'Test'
+      AND NOT EXISTS {
+        MATCH (method)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+        WHERE a.attributes_json CONTAINS 'testing'
+      }
       
-      OPTIONAL MATCH (testMethod)
+      OPTIONAL MATCH (testMethod:CodeNode)
       WHERE testMethod.project_id = $project
       AND testMethod.type = 'method'
-      AND any(annotation IN coalesce(testMethod.attributes.annotations, []) 
-              WHERE annotation.category = 'testing')
+      AND EXISTS {
+        MATCH (testMethod)-[:ANNOTATED_WITH]->(ta:CodeNode {type: 'annotation'})
+        WHERE ta.attributes_json CONTAINS 'testing'
+      }
       AND (testMethod.qualified_name CONTAINS method.name 
            OR testMethod.name CONTAINS method.name)
       
@@ -144,11 +142,13 @@ export async function findUntestableCode(neo4jClient: Neo4jClient, params: { pro
   const { project } = params;
   
   const query = `
-    MATCH (n)
+    MATCH (n:CodeNode)
     WHERE n.project_id = $project
     AND n.type IN ['method', 'function']
-    AND NOT any(annotation IN coalesce(n.attributes.annotations, []) 
-                WHERE annotation.category = 'testing')
+    AND NOT EXISTS {
+      MATCH (n)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+      WHERE a.attributes_json CONTAINS 'testing'
+    }
     
     // Look for methods that are private or have testing-unfriendly patterns
     WITH n,
@@ -156,7 +156,6 @@ export async function findUntestableCode(neo4jClient: Neo4jClient, params: { pro
            WHEN any(modifier IN coalesce(n.modifiers, []) WHERE modifier = 'private') THEN 'private'
            WHEN any(modifier IN coalesce(n.modifiers, []) WHERE modifier = 'static') THEN 'static'
            WHEN n.qualified_name CONTAINS '__' THEN 'private_python'
-           WHEN size(coalesce(n.attributes.parameters, [])) > 10 THEN 'too_many_parameters'
            ELSE 'public'
          END as testability_concern
     
@@ -166,8 +165,7 @@ export async function findUntestableCode(neo4jClient: Neo4jClient, params: { pro
            collect({
              qualified_name: n.qualified_name,
              type: n.type,
-             source_file: n.source_file,
-             parameter_count: size(coalesce(n.attributes.parameters, []))
+             source_file: n.source_file
            }) as methods,
            count(n) as count
     ORDER BY count DESC

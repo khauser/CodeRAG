@@ -103,8 +103,8 @@ export class CodebaseScanner {
       console.log(`📁 Found ${files.length} source files`);
 
       // Process and store files in streaming batches to avoid heap overflow
-      const fileBatchSize = 10;
-      const storeBatchSize = 500; // Store to DB every N files
+      const fileBatchSize = 50;
+      const storeBatchSize = 1000; // Store to DB every N files
       let pendingEntities: ParsedEntity[] = [];
       let pendingRelationships: ParsedRelationship[] = [];
 
@@ -514,43 +514,41 @@ export class CodebaseScanner {
     }, {} as Record<string, number>);
     console.log(`📋 Entity types:`, entityTypeCounts);
     
-    // Store entities in batches and track successfully stored ones
+    // Store entities using batch UNWIND for high throughput
     const successfullyStoredEntities: ParsedEntity[] = [];
-    const entityBatchSize = 25;
-    for (let i = 0; i < deduplicatedEntities.length; i += entityBatchSize) {
-      const batch = deduplicatedEntities.slice(i, i + entityBatchSize);
-      await Promise.all(batch.map(async (entity) => {
-        try {
-          await this.nodeManager.addNode({
-            id: entity.id,
-            project_id: entity.project_id,
-            type: entity.type as any,
-            name: entity.name,
-            qualified_name: entity.qualified_name,
-            description: entity.description,
-            source_file: entity.source_file,
-            start_line: entity.start_line,
-            end_line: entity.end_line,
-            modifiers: entity.modifiers,
-            attributes: entity.attributes
-          });
-          successfullyStoredEntities.push(entity);
-        } catch (error) {
-          // Skip duplicates or other node creation errors
-          if (!(error instanceof Error) || !error.message.includes('already exists')) {
-            console.warn(`Failed to store entity ${entity.id}: ${error instanceof Error ? error.message : String(error)}`);
-            errors.push({
-              type: 'node_creation_error',
-              entity_id: entity.id,
-              message: error instanceof Error ? error.message : String(error),
-              severity: 'error'
-            });
-          } else {
-            // Entity already exists, still consider it for embeddings
-            successfullyStoredEntities.push(entity);
-          }
-        }
-      }));
+    const nodeBatchResult = await this.nodeManager.addNodesBatch(
+      deduplicatedEntities.map(entity => ({
+        id: entity.id,
+        project_id: entity.project_id,
+        type: entity.type as any,
+        name: entity.name,
+        qualified_name: entity.qualified_name,
+        description: entity.description,
+        source_file: entity.source_file,
+        start_line: entity.start_line,
+        end_line: entity.end_line,
+        modifiers: entity.modifiers,
+        is_abstract: (entity.modifiers || []).includes('abstract'),
+        attributes: entity.attributes
+      }))
+    );
+
+    // Track successfully stored entities for embedding generation
+    const failedEntityIds = new Set(nodeBatchResult.errors.map(e => e.node.id));
+    for (const entity of deduplicatedEntities) {
+      if (!failedEntityIds.has(entity.id)) {
+        successfullyStoredEntities.push(entity);
+      }
+    }
+
+    for (const { node, error } of nodeBatchResult.errors) {
+      console.warn(`Failed to store entity ${node.id}: ${error}`);
+      errors.push({
+        type: 'node_creation_error',
+        entity_id: node.id,
+        message: error,
+        severity: 'error'
+      });
     }
 
     console.log(`🔗 Storing relationships...`);
@@ -609,21 +607,18 @@ export class CodebaseScanner {
 
     if (stubsToStore.length > 0) {
       console.log(`📋 Creating ${stubsToStore.length} stub nodes for external/cross-cartridge targets`);
-      for (const stub of stubsToStore) {
-        try {
-          await this.nodeManager.addNode({
-            id: stub.id,
-            project_id: stub.project_id,
-            type: stub.type as any,
-            name: stub.name,
-            qualified_name: stub.qualified_name,
-            source_file: stub.source_file,
-            modifiers: stub.modifiers
-          });
-        } catch {
-          // Already exists from a prior scan — that's fine
-        }
-      }
+      await this.nodeManager.addNodesBatch(
+        stubsToStore.map(stub => ({
+          id: stub.id,
+          project_id: stub.project_id,
+          type: stub.type as any,
+          name: stub.name,
+          qualified_name: stub.qualified_name,
+          source_file: stub.source_file,
+          modifiers: stub.modifiers,
+          attributes: {}
+        }))
+      );
     }
 
     // Filter out relationships where source doesn't exist.
@@ -656,7 +651,7 @@ export class CodebaseScanner {
     // Batch-insert relationships grouped by type using UNWIND queries.
     // This replaces the previous one-by-one approach and reduces DB round-trips
     // from N to ceil(N / 500) * numTypes.
-    const batchResult = await this.edgeManager.addEdgesBatch(
+    const edgeBatchResult = await this.edgeManager.addEdgesBatch(
       storableRelationships.map(r => ({
         id: r.id,
         project_id: r.project_id,
@@ -667,9 +662,9 @@ export class CodebaseScanner {
       }))
     );
 
-    const storedCount = batchResult.stored;
+    const storedCount = edgeBatchResult.stored;
 
-    for (const { edge, error } of batchResult.errors) {
+    for (const { edge, error } of edgeBatchResult.errors) {
       if (!error.includes('already exists')) {
         console.warn(`Failed to store relationship ${edge.id}: ${error}`);
         errors.push({

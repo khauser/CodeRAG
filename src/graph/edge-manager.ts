@@ -50,7 +50,7 @@ export class EdgeManager {
    */
   async addEdgesBatch(
     edges: CodeEdge[],
-    batchSize = 100
+    batchSize = 500
   ): Promise<{ stored: number; errors: Array<{ edge: CodeEdge; error: string }> }> {
     if (edges.length === 0) return { stored: 0, errors: [] };
 
@@ -279,11 +279,10 @@ export class EdgeManager {
 
   async findClassesThatImplementInterface(interfaceName: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH (target:CodeNode {project_id: $project_id})
+      MATCH (target {project_id: $project_id})
       WHERE (target.name = $interfaceName OR target.qualified_name = $interfaceName OR target.id = $interfaceName)
         AND target.type IN ['interface', 'class']
-      MATCH (class:CodeNode {type: 'class', project_id: $project_id})-[r:IMPLEMENTS|EXTENDS {project_id: $project_id}]->(target)
-      WHERE target.type = 'interface' OR target.is_abstract = true
+      MATCH (class {type: 'class', project_id: $project_id})-[r:IMPLEMENTS|EXTENDS {project_id: $project_id}]->(target)
       RETURN class.name as className, class.qualified_name as qualifiedName
       ORDER BY className
     `;
@@ -294,9 +293,9 @@ export class EdgeManager {
 
   async findInheritanceHierarchy(className: string, projectId: string): Promise<string[]> {
     const query = `
-      MATCH (child:CodeNode {project_id: $project_id})
+      MATCH (child {project_id: $project_id})
       WHERE child.name = $className OR child.qualified_name = $className
-      MATCH path = (child)-[:EXTENDS*]->(ancestor:CodeNode)
+      MATCH path = (child)-[:EXTENDS*]->(ancestor)
       WHERE ALL(r IN relationships(path) WHERE r.project_id = $project_id)
         AND ALL(node IN nodes(path) WHERE node.project_id = $project_id)
       RETURN [node IN nodes(path) | node.name] as hierarchy

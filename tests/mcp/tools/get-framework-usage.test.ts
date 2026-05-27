@@ -96,7 +96,7 @@ describe('Get Framework Usage Tool', () => {
       const result = await getFrameworkUsage(mockNeo4jClient);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('WHERE annotation.framework IS NOT NULL'),
+        expect.stringContaining('WHERE attrs.framework IS NOT NULL'),
         { min_usage_count: 1 }
       );
       expect(result.frameworks).toHaveLength(2);
@@ -159,7 +159,7 @@ describe('Get Framework Usage Tool', () => {
       const result = await getFrameworkUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('annotation.parameters as parameters'),
+        expect.stringContaining('attrs.annotation_parameters as parameters'),
         { min_usage_count: 1 }
       );
       expect(result.frameworks).toHaveLength(1);
@@ -331,7 +331,7 @@ describe('Get Framework Usage Tool', () => {
       const result = await getFrameworkUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('annotation.parameters as parameters'),
+        expect.stringContaining('attrs.annotation_parameters as parameters'),
         { min_usage_count: 3 }
       );
       expect(result.frameworks).toHaveLength(1);

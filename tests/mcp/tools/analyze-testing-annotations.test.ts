@@ -143,7 +143,7 @@ describe('Analyze Testing Annotations Tools', () => {
       const result = await analyzeTestingAnnotations(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.framework = $framework'),
+        expect.stringContaining('AND attrs.framework = $framework'),
         { project: 'test-project', framework: 'JUnit' }
       );
       expect(result.test_entities).toHaveLength(1);

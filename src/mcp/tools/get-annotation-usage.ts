@@ -13,40 +13,52 @@ export async function getAnnotationUsage(
 ) {
   const { category, framework, include_deprecated = true, group_by = 'annotation' } = params;
   
+  // Use ANNOTATED_WITH edges and annotation node attributes (framework, category stored in attributes_json)
   let query = `
-    MATCH (n)
-    WHERE n.attributes IS NOT NULL 
-    AND n.attributes.annotations IS NOT NULL
-    UNWIND n.attributes.annotations as annotation
-    WITH n, annotation
-    WHERE annotation.name IS NOT NULL
+    MATCH (n:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+    WHERE a.name IS NOT NULL
   `;
   
   const queryParams: any = {};
   
   if (category) {
-    query += ` AND annotation.category = $category`;
+    query += ` AND a.attributes_json CONTAINS $category`;
     queryParams.category = category;
   }
   
   if (framework) {
-    query += ` AND annotation.framework = $framework`;
+    query += ` AND a.attributes_json CONTAINS $framework`;
     queryParams.framework = framework;
   }
   
   if (!include_deprecated) {
-    query += ` AND annotation.name <> '@Deprecated' AND annotation.name <> 'deprecated'`;
+    query += ` AND a.name <> '@Deprecated' AND a.name <> 'deprecated'`;
+  }
+
+  // We need to extract framework/category from attributes_json at runtime
+  query += `
+    WITH n, a,
+         apoc.convert.fromJsonMap(a.attributes_json) AS attrs
+  `;
+
+  // Add post-parse filters for exact category/framework match
+  if (category) {
+    query += ` WHERE attrs.category = $category`;
+  }
+  if (framework) {
+    query += ` ${category ? 'AND' : 'WHERE'} attrs.framework = $framework`;
   }
   
   switch (group_by) {
     case 'category':
       query += `
-        WITH annotation.category as grouping_key,
-             annotation.name as annotation_name,
-             annotation.framework as framework,
-             count(*) as usage_count,
+        WITH attrs.category as grouping_key,
+             a.name as annotation_name,
+             attrs.framework as framework,
+             count(DISTINCT n) as usage_count,
              collect(DISTINCT n.type) as node_types,
              collect(DISTINCT n.qualified_name) as sample_nodes
+        WHERE grouping_key IS NOT NULL
         RETURN grouping_key as category,
                collect({
                  name: annotation_name,
@@ -62,10 +74,10 @@ export async function getAnnotationUsage(
       
     case 'framework':
       query += `
-        WITH annotation.framework as grouping_key,
-             annotation.name as annotation_name,
-             annotation.category as category,
-             count(*) as usage_count,
+        WITH attrs.framework as grouping_key,
+             a.name as annotation_name,
+             attrs.category as category,
+             count(DISTINCT n) as usage_count,
              collect(DISTINCT n.type) as node_types,
              collect(DISTINCT n.qualified_name) as sample_nodes
         WHERE grouping_key IS NOT NULL
@@ -84,11 +96,11 @@ export async function getAnnotationUsage(
       
     default: // 'annotation'
       query += `
-        WITH annotation.name as grouping_key,
-             annotation.framework as framework,
-             annotation.category as category,
-             annotation.type as annotation_type,
-             count(*) as usage_count,
+        WITH a.name as grouping_key,
+             attrs.framework as framework,
+             attrs.category as category,
+             a.type as annotation_type,
+             count(DISTINCT n) as usage_count,
              collect(DISTINCT n.type) as node_types,
              collect(DISTINCT n.qualified_name) as sample_nodes
         RETURN grouping_key as annotation_name,

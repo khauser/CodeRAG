@@ -11,15 +11,13 @@ export async function findDeprecatedCode(
 ) {
   const { include_dependencies = false, node_type } = params;
   
-  let query = `
-    MATCH (n)
-    WHERE n.attributes IS NOT NULL 
-    AND n.attributes.annotations IS NOT NULL
-    AND any(annotation IN n.attributes.annotations 
-         WHERE annotation.name IN ['@Deprecated', 'deprecated', '@deprecated'])
-  `;
-  
   const queryParams: any = {};
+
+  // Strategy 1: Use ANNOTATED_WITH edges to annotation nodes (preferred graph model)
+  let query = `
+    MATCH (n:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+    WHERE a.name IN ['@Deprecated', 'Deprecated', 'deprecated', '@deprecated']
+  `;
   
   if (node_type) {
     query += ` AND n.type = $node_type`;
@@ -28,33 +26,67 @@ export async function findDeprecatedCode(
   
   if (include_dependencies) {
     query += `
-      OPTIONAL MATCH (n)<-[r:calls|references|extends|implements]-(dependentNode)
-      WITH n, 
-           [annotation IN n.attributes.annotations 
-            WHERE annotation.name IN ['@Deprecated', 'deprecated', '@deprecated']][0] as deprecation_annotation,
+      OPTIONAL MATCH (n)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(dependentNode)
+      WITH n, a,
            collect(DISTINCT {
              node: dependentNode.qualified_name,
              relationship: type(r),
              type: dependentNode.type
            }) as dependencies
       RETURN n,
-             deprecation_annotation,
+             a as deprecation_annotation,
              dependencies,
              size(dependencies) as dependency_count
       ORDER BY dependency_count DESC, n.qualified_name
     `;
   } else {
     query += `
-      WITH n,
-           [annotation IN n.attributes.annotations 
-            WHERE annotation.name IN ['@Deprecated', 'deprecated', '@deprecated']][0] as deprecation_annotation
       RETURN n,
-             deprecation_annotation
+             a as deprecation_annotation
       ORDER BY n.qualified_name
     `;
   }
   
-  const result = await neo4jClient.runQuery(query, queryParams);
+  let result = await neo4jClient.runQuery(query, queryParams);
+
+  // Strategy 2: Fallback — search in attributes_json for deprecated markers
+  if (!result.records || result.records.length === 0) {
+    let fallbackQuery = `
+      MATCH (n:CodeNode)
+      WHERE (n.attributes_json CONTAINS 'Deprecated' OR n.attributes_json CONTAINS 'deprecated')
+    `;
+    const fallbackParams: any = {};
+
+    if (node_type) {
+      fallbackQuery += ` AND n.type = $node_type`;
+      fallbackParams.node_type = node_type;
+    }
+
+    if (include_dependencies) {
+      fallbackQuery += `
+        OPTIONAL MATCH (n)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(dependentNode)
+        WITH n,
+             collect(DISTINCT {
+               node: dependentNode.qualified_name,
+               relationship: type(r),
+               type: dependentNode.type
+             }) as dependencies
+        RETURN n,
+               null as deprecation_annotation,
+               dependencies,
+               size(dependencies) as dependency_count
+        ORDER BY dependency_count DESC, n.qualified_name
+      `;
+    } else {
+      fallbackQuery += `
+        RETURN n,
+               null as deprecation_annotation
+        ORDER BY n.qualified_name
+      `;
+    }
+
+    result = await neo4jClient.runQuery(fallbackQuery, fallbackParams);
+  }
   
   return {
     deprecated_nodes: result.records?.map(record => {
@@ -62,7 +94,7 @@ export async function findDeprecatedCode(
       const deprecationAnnotation = record.get('deprecation_annotation');
       const response: any = {
         ...node,
-        deprecation_info: deprecationAnnotation
+        deprecation_info: deprecationAnnotation?.properties ?? deprecationAnnotation ?? null
       };
       
       if (include_dependencies) {
@@ -82,22 +114,16 @@ export async function findUsageOfDeprecatedCode(
 ) {
   const { include_usage_details = false } = params;
   
-  const query = `
-    MATCH (deprecated)
-    WHERE deprecated.attributes IS NOT NULL 
-    AND deprecated.attributes.annotations IS NOT NULL
-    AND any(annotation IN deprecated.attributes.annotations 
-         WHERE annotation.name IN ['@Deprecated', 'deprecated', '@deprecated'])
-    
-    MATCH (deprecated)<-[r:calls|references|extends|implements]-(using)
+  // Strategy 1: Use ANNOTATED_WITH edges (preferred graph model)
+  let query = `
+    MATCH (deprecated:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+    WHERE a.name IN ['@Deprecated', 'Deprecated', 'deprecated', '@deprecated']
+    MATCH (deprecated)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(using)
     
     ${include_usage_details ? `
-      WITH deprecated, using, r,
-           [annotation IN deprecated.attributes.annotations 
-            WHERE annotation.name IN ['@Deprecated', 'deprecated', '@deprecated']][0] as deprecation_info
       RETURN deprecated.qualified_name as deprecated_node,
              deprecated.type as deprecated_type,
-             deprecation_info,
+             a as deprecation_info,
              collect({
                using_node: using.qualified_name,
                using_type: using.type,
@@ -114,7 +140,37 @@ export async function findUsageOfDeprecatedCode(
     `}
   `;
   
-  const result = await neo4jClient.runQuery(query);
+  let result = await neo4jClient.runQuery(query);
+
+  // Strategy 2: Fallback — search in attributes_json
+  if (!result.records || result.records.length === 0) {
+    let fallbackQuery = `
+      MATCH (deprecated:CodeNode)
+      WHERE (deprecated.attributes_json CONTAINS 'Deprecated' OR deprecated.attributes_json CONTAINS 'deprecated')
+      MATCH (deprecated)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(using)
+      
+      ${include_usage_details ? `
+        RETURN deprecated.qualified_name as deprecated_node,
+               deprecated.type as deprecated_type,
+               null as deprecation_info,
+               collect({
+                 using_node: using.qualified_name,
+                 using_type: using.type,
+                 relationship: type(r),
+                 source_file: using.source_file
+               }) as usage_details,
+               count(using) as usage_count
+        ORDER BY usage_count DESC
+      ` : `
+        RETURN deprecated.qualified_name as deprecated_node,
+               deprecated.type as deprecated_type,
+               count(using) as usage_count
+        ORDER BY usage_count DESC
+      `}
+    `;
+
+    result = await neo4jClient.runQuery(fallbackQuery);
+  }
   
   return {
     deprecated_usage: result.records?.map(record => {
@@ -125,7 +181,8 @@ export async function findUsageOfDeprecatedCode(
       };
       
       if (include_usage_details) {
-        response.deprecation_info = record.get('deprecation_info');
+        const depInfo = record.get('deprecation_info');
+        response.deprecation_info = depInfo?.properties ?? depInfo ?? null;
         response.usage_details = record.get('usage_details');
       }
       

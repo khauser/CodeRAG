@@ -52,6 +52,107 @@ export class NodeManager {
     return this.recordToNode(result.records[0].get('n'));
   }
 
+  /**
+   * Batch-inserts nodes using UNWIND for high throughput.
+   * Nodes are grouped by type (since Cypher requires static labels) and inserted
+   * in batches to reduce DB round-trips from N individual CREATEs to ceil(N/batchSize) * numTypes.
+   *
+   * Returns the number of successfully stored nodes and an array of errors.
+   */
+  async addNodesBatch(
+    nodes: CodeNode[],
+    batchSize = 200
+  ): Promise<{ stored: number; errors: Array<{ node: CodeNode; error: string }> }> {
+    if (nodes.length === 0) return { stored: 0, errors: [] };
+
+    // Group nodes by type (label combination depends on type)
+    const byType = new Map<string, CodeNode[]>();
+    for (const node of nodes) {
+      const t = node.type;
+      if (!byType.has(t)) byType.set(t, []);
+      byType.get(t)!.push(node);
+    }
+
+    let totalStored = 0;
+    const errors: Array<{ node: CodeNode; error: string }> = [];
+
+    for (const [type, typeNodes] of byType) {
+      const nodeLabel = this.getNodeLabel(type as CodeNode['type']);
+
+      for (let i = 0; i < typeNodes.length; i += batchSize) {
+        const batch = typeNodes.slice(i, i + batchSize);
+        const projectId = batch[0].project_id;
+        const projectLabel = this.client.getProjectLabel(projectId, type as CodeNode['type']);
+
+        const rows = batch.map(n => ({
+          id: n.id,
+          project_id: n.project_id,
+          type: n.type,
+          name: n.name,
+          qualified_name: n.qualified_name,
+          description: n.description || null,
+          source_file: n.source_file || null,
+          start_line: n.start_line || null,
+          end_line: n.end_line || null,
+          modifiers: n.modifiers || [],
+          is_abstract: n.is_abstract ?? (n.modifiers || []).includes('abstract'),
+          attributes_json: JSON.stringify(n.attributes || {})
+        }));
+
+        const query = `
+          UNWIND $rows AS row
+          CREATE (n:${nodeLabel}:${projectLabel}:CodeNode {
+            id: row.id,
+            project_id: row.project_id,
+            type: row.type,
+            name: row.name,
+            qualified_name: row.qualified_name,
+            description: row.description,
+            source_file: row.source_file,
+            start_line: row.start_line,
+            end_line: row.end_line,
+            modifiers: row.modifiers,
+            is_abstract: row.is_abstract,
+            attributes_json: row.attributes_json
+          })
+          RETURN row.id AS id
+        `;
+
+        try {
+          const result = await this.client.runQuery(
+            query,
+            this.ensurePlainObject({ rows })
+          );
+          totalStored += result.records.length;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          // If batch fails (e.g. constraint violation), fall back to individual inserts
+          if (message.includes('already exists') || message.includes('ConstraintValidation')) {
+            for (const node of batch) {
+              try {
+                await this.addNode(node);
+                totalStored++;
+              } catch (innerError) {
+                const innerMsg = innerError instanceof Error ? innerError.message : String(innerError);
+                if (!innerMsg.includes('already exists')) {
+                  errors.push({ node, error: innerMsg });
+                } else {
+                  totalStored++; // Already exists counts as stored
+                }
+              }
+            }
+          } else {
+            for (const node of batch) {
+              errors.push({ node, error: message });
+            }
+          }
+        }
+      }
+    }
+
+    return { stored: totalStored, errors };
+  }
+
   async updateNode(nodeId: string, projectId: string, updates: Partial<CodeNode>): Promise<CodeNode> {
     const setParts: string[] = [];
     const parameters: Record<string, any> = { id: nodeId };

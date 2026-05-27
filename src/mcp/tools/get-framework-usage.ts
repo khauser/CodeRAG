@@ -11,17 +11,16 @@ export async function getFrameworkUsage(
 ) {
   const { include_parameters = false, min_usage_count = 1 } = params;
   
+  // Use ANNOTATED_WITH edges and annotation node attributes (framework, category stored in attributes_json)
   const query = `
-    MATCH (n)
-    WHERE n.attributes IS NOT NULL 
-    AND n.attributes.annotations IS NOT NULL
-    UNWIND n.attributes.annotations as annotation
-    WITH n, annotation
-    WHERE annotation.framework IS NOT NULL
-    WITH annotation.framework as framework,
-         annotation.name as annotation_name,
-         annotation.category as category${include_parameters ? ',\n         annotation.parameters as parameters' : ''},
-         count(*) as usage_count,
+    MATCH (n:CodeNode)-[:ANNOTATED_WITH]->(a:CodeNode {type: 'annotation'})
+    WHERE a.attributes_json IS NOT NULL
+    WITH n, a, apoc.convert.fromJsonMap(a.attributes_json) AS attrs
+    WHERE attrs.framework IS NOT NULL
+    WITH attrs.framework as framework,
+         a.name as annotation_name,
+         attrs.category as category${include_parameters ? ',\n         attrs.annotation_parameters as parameters' : ''},
+         count(DISTINCT n) as usage_count,
          collect(DISTINCT n.qualified_name) as nodes_using
     WHERE usage_count >= $min_usage_count
     RETURN framework,

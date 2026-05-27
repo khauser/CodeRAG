@@ -105,7 +105,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.category = $category'),
+        expect.stringContaining('WHERE attrs.category = $category'),
         { category: 'testing' }
       );
       expect(result.annotations).toHaveLength(1);
@@ -141,7 +141,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.framework = $framework'),
+        expect.stringContaining('attrs.framework = $framework'),
         { framework: 'Spring' }
       );
       expect(result.annotations).toHaveLength(1);
@@ -177,7 +177,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining("AND annotation.name <> '@Deprecated'"),
+        expect.stringContaining("AND a.name <> '@Deprecated'"),
         {}
       );
       expect(result.annotations).toHaveLength(1);
@@ -242,7 +242,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('WITH annotation.category as grouping_key'),
+        expect.stringContaining('WITH attrs.category as grouping_key'),
         {}
       );
       expect(result.groups).toHaveLength(2);
@@ -293,7 +293,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('WITH annotation.framework as grouping_key'),
+        expect.stringContaining('WITH attrs.framework as grouping_key'),
         {}
       );
       expect(result.groups).toHaveLength(1);
@@ -370,7 +370,7 @@ describe('Get Annotation Usage Tool', () => {
       const result = await getAnnotationUsage(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND annotation.category = $category'),
+        expect.stringContaining('WHERE attrs.category = $category'),
         { category: 'web', framework: 'Spring' }
       );
       expect(result.annotations).toHaveLength(1);
