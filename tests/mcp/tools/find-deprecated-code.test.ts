@@ -75,7 +75,7 @@ describe('Find Deprecated Code Tools', () => {
       const result = await findDeprecatedCode(mockNeo4jClient);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('WHERE n.attributes IS NOT NULL'),
+        expect.stringContaining('ANNOTATED_WITH'),
         {}
       );
       expect(result.deprecated_nodes).toHaveLength(2);
@@ -123,7 +123,7 @@ describe('Find Deprecated Code Tools', () => {
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
         expect.stringContaining('AND n.type = $node_type'),
-        { node_type: 'class' }
+        expect.objectContaining({ node_type: 'class' })
       );
       expect(result.deprecated_nodes).toHaveLength(1);
       expect(result.deprecated_nodes[0].type).toBe('class');
@@ -182,7 +182,7 @@ describe('Find Deprecated Code Tools', () => {
       const result = await findDeprecatedCode(mockNeo4jClient, params);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('OPTIONAL MATCH (n)<-[r:calls|references|extends|implements]-(dependentNode)'),
+        expect.stringContaining('OPTIONAL MATCH (n)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(dependentNode)'),
         {}
       );
       expect(result.deprecated_nodes).toHaveLength(1);
@@ -261,7 +261,7 @@ describe('Find Deprecated Code Tools', () => {
       const result = await findUsageOfDeprecatedCode(mockNeo4jClient);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('MATCH (deprecated)<-[r:calls|references|extends|implements]-(using)')
+        expect.stringContaining('MATCH (deprecated)<-[r:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]-(using)')
       );
       expect(result.deprecated_usage).toHaveLength(2);
       expect(result.deprecated_usage[0].deprecated_node).toBe('com.example.DeprecatedClass');

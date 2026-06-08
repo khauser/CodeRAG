@@ -184,7 +184,7 @@ describe('SemanticSearchManager', () => {
       });
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('vector.similarity.cosine'),
+        expect.stringContaining("db.index.vector.queryNodes('semantic_embeddings'"),
         expect.objectContaining({
           queryVector: mockEmbedding.vector,
           threshold: 0.7,
@@ -206,7 +206,7 @@ describe('SemanticSearchManager', () => {
       await manager.semanticSearch(paramsWithFilter);
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
-        expect.stringContaining('AND n.type IN $nodeTypes'),
+        expect.stringContaining('AND node.type IN $nodeTypes'),
         expect.objectContaining({
           nodeTypes: ['function', 'method']
         })

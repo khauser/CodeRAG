@@ -81,35 +81,37 @@ export class SemanticSearchManager {
       throw new Error('Failed to generate embedding for query');
     }
 
-    // Build the search query
+    // Build the search query using the native vector index for performance
     const limit = neo4j.int(Math.floor(params.limit || 10));
     const threshold = params.similarity_threshold || this.config.similarity_threshold;
     
-    let whereClause = 'n.semantic_embedding IS NOT NULL';
     const queryParams: Record<string, any> = {
       queryVector: queryEmbedding.vector,
       limit: limit,
       threshold: threshold
     };
 
-    // Add project filter
+    // Use db.index.vector.queryNodes for fast ANN search via the vector index,
+    // then apply post-filters for project_id and node_types.
+    let postFilter = '';
     if (params.project_id) {
-      whereClause += ' AND n.project_id = $projectId';
+      postFilter += ' AND node.project_id = $projectId';
       queryParams.projectId = params.project_id;
     }
-
-    // Add node type filter
     if (params.node_types && params.node_types.length > 0) {
-      whereClause += ' AND n.type IN $nodeTypes';
+      postFilter += ' AND node.type IN $nodeTypes';
       queryParams.nodeTypes = params.node_types;
     }
 
+    // Request more candidates from the index to compensate for post-filtering
+    const indexCandidates = neo4j.int(Math.floor((params.limit || 10) * 5));
+    queryParams.indexCandidates = indexCandidates;
+
     const searchQuery = `
-      MATCH (n:CodeNode)
-      WHERE ${whereClause}
-      WITH n, vector.similarity.cosine(n.semantic_embedding, $queryVector) AS similarity
-      WHERE similarity >= $threshold
-      RETURN n, similarity
+      CALL db.index.vector.queryNodes('semantic_embeddings', $indexCandidates, $queryVector)
+      YIELD node, score AS similarity
+      WHERE similarity >= $threshold${postFilter}
+      RETURN node AS n, similarity
       ORDER BY similarity DESC
       LIMIT $limit
     `;
@@ -205,15 +207,14 @@ export class SemanticSearchManager {
     const targetEmbedding = nodeResult.records[0].get('embedding');
     const targetNode = this.neo4jRecordToCodeNode(nodeResult.records[0].get('n'));
 
-    // Find similar nodes
+    // Find similar nodes using vector index for fast ANN search
+    // Request extra candidates to compensate for filtering out the source node and project filter
+    const indexCandidates = neo4j.int(Math.floor(limit * 5));
     const similarQuery = `
-      MATCH (n:CodeNode)
-      WHERE n.semantic_embedding IS NOT NULL 
-        AND n.project_id = $projectId 
-        AND n.id <> $nodeId
-      WITH n, vector.similarity.cosine(n.semantic_embedding, $targetEmbedding) AS similarity
-      WHERE similarity >= $threshold
-      RETURN n, similarity
+      CALL db.index.vector.queryNodes('semantic_embeddings', $indexCandidates, $targetEmbedding)
+      YIELD node, score AS similarity
+      WHERE node.project_id = $projectId AND node.id <> $nodeId AND similarity >= $threshold
+      RETURN node AS n, similarity
       ORDER BY similarity DESC
       LIMIT $limit
     `;
@@ -223,7 +224,8 @@ export class SemanticSearchManager {
       nodeId,
       targetEmbedding,
       threshold: this.config.similarity_threshold,
-      limit: limitInt
+      limit: limitInt,
+      indexCandidates
     });
 
     return result.records.map(record => {

@@ -1433,7 +1433,10 @@ What aspect of inheritance would you like to explore first?`;
   }
 
   protected async handleSemanticSearch(args: any) {
-    const params: SemanticSearchToolParams = args;
+    const params: SemanticSearchToolParams = {
+      ...args,
+      project_id: args?.project_id ? await this.resolveProject(args.project_id) : undefined
+    };
     const result = await semanticSearch(this.semanticSearchManager, params);
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -1449,7 +1452,10 @@ What aspect of inheritance would you like to explore first?`;
   }
 
   protected async handleGetSimilarCode(args: any) {
-    const params: GetSimilarCodeParams = args;
+    const params: GetSimilarCodeParams = {
+      ...args,
+      project_id: args?.project_id ? await this.resolveProject(args.project_id) : args?.project_id
+    };
     const result = await getSimilarCode(this.semanticSearchManager, params);
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]

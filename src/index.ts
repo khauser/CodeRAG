@@ -14,6 +14,8 @@ async function main() {
     const client = new Neo4jClient(config);
     await client.connect();
     await client.initializeDatabase();
+    // Prime caches so the first user request doesn't hit the cold-start timeout.
+    await client.warmup();
 
     // Determine server mode from command line arguments
     const args = process.argv.slice(2);

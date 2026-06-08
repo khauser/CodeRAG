@@ -5,6 +5,8 @@ export class Neo4jClient {
   private driver: Driver | null = null;
   private projectConfig: ProjectConfig;
   private projectIdCache: Map<string, string> = new Map();
+  /** Cached list of all known project_ids (primed lazily / by warmup) to avoid repeated full scans. */
+  private knownProjectIds: string[] | null = null;
 
   constructor(private config: Neo4jConfig, projectConfig?: ProjectConfig) {
     this.projectConfig = projectConfig || {
@@ -18,7 +20,15 @@ export class Neo4jClient {
     try {
       this.driver = neo4j.driver(
         this.config.uri,
-        neo4j.auth.basic(this.config.user, this.config.password)
+        neo4j.auth.basic(this.config.user, this.config.password),
+        {
+          // Keep a warm pool so requests don't pay TCP/auth setup repeatedly.
+          maxConnectionPoolSize: 50,
+          // Fail fast instead of blocking forever when the DB is unreachable.
+          connectionAcquisitionTimeout: 60_000, // ms
+          connectionTimeout: 20_000, // ms
+          maxConnectionLifetime: 60 * 60 * 1000, // 1h
+        }
       );
       
       // Verify connectivity
@@ -99,12 +109,8 @@ export class Neo4jClient {
       return userInput;
     }
 
-    // Try suffix/contains match against known project IDs
-    const allProjects = await this.runQuery(
-      'MATCH (n:CodeNode) RETURN DISTINCT n.project_id as pid'
-    );
-    
-    const allProjectIds = allProjects.records.map(r => r.get('pid') as string);
+    // Suffix/contains match against the (cached) list of known project IDs.
+    const allProjectIds = await this.getKnownProjectIds();
     
     // Strategy 1: ends with the user input (e.g., "icm-as" matches "intershop-com/Products-icm-as")
     const suffixMatch = allProjectIds.find(pid => 
@@ -128,6 +134,55 @@ export class Neo4jClient {
     // No match found — return as-is (will likely result in empty results)
     this.projectIdCache.set(userInput, userInput);
     return userInput;
+  }
+
+  /**
+   * Returns the list of all known project IDs, cached for the lifetime of the process.
+   * Prefers the small {@link ProjectContext} node set (cheap, indexed) and only falls
+   * back to a DISTINCT scan over all CodeNodes when no ProjectContext nodes exist.
+   * This avoids an expensive full graph scan on every cache miss, which on large
+   * databases with a cold page cache could exceed the MCP request timeout.
+   */
+  async getKnownProjectIds(forceRefresh = false): Promise<string[]> {
+    if (this.knownProjectIds && !forceRefresh) {
+      return this.knownProjectIds;
+    }
+
+    // Cheap path: read from the small ProjectContext node set.
+    const contextResult = await this.runQuery(
+      'MATCH (p:ProjectContext) RETURN p.project_id as pid'
+    );
+    let ids = contextResult.records
+      .map(r => r.get('pid') as string)
+      .filter(pid => !!pid);
+
+    // Fallback only when no ProjectContext nodes are present (legacy data).
+    if (ids.length === 0) {
+      const scanResult = await this.runQuery(
+        'MATCH (n:CodeNode) RETURN DISTINCT n.project_id as pid'
+      );
+      ids = scanResult.records
+        .map(r => r.get('pid') as string)
+        .filter(pid => !!pid);
+    }
+
+    this.knownProjectIds = ids;
+    return ids;
+  }
+
+  /**
+   * Primes connection pool, page cache and the project-id cache so that the first
+   * real user request does not pay the cold-start cost (which can otherwise exceed
+   * the MCP request timeout right after a database restart).
+   */
+  async warmup(): Promise<void> {
+    try {
+      await this.getKnownProjectIds(true);
+      // Touch the CodeNode index so the page cache is warm for typical lookups.
+      await this.runQuery('MATCH (n:CodeNode) RETURN count(n) as c');
+    } catch (error) {
+      console.error('Warmup query failed (non-fatal):', error);
+    }
   }
 
   async initializeDatabase(): Promise<void> {
