@@ -330,6 +330,29 @@ Step 2: Overview Analysis
 - Provide specific class names when possible
 - Include language context for better guidance
 - Use project_id in multi-project environments
+- **Pass the current local Git branch** via the optional `branch` parameter on every
+  project-scoped tool call (see below)
+
+### Branch-Aware Querying (AI guidance)
+
+CodeRAG can hold multiple branches of the same codebase (see
+[Branch Support](multi-project-management.md#branch-support)). To get the most relevant
+context, the AI should determine the **current local branch** and pass it as the
+`branch` argument:
+
+1. Run `git rev-parse --abbrev-ref HEAD` in the workspace to get the active branch.
+2. Pass that value as `branch` to tools like `search_nodes`, `semantic_search`,
+   `find_implementations`, etc.
+3. If the branch is a feature branch that is not indexed, the server automatically falls
+   back to an integration branch (e.g. `develop` → `main`) and prepends a `⚠️` notice
+   stating which branch actually served the data. Treat that context as the **base**,
+   and read the local feature diff directly from the working-tree files.
+
+To make this automatic for an analyzed repository, drop an agent-instruction file into
+that repo. A ready-to-use template ships with CodeRAG at
+[`docs/examples/AGENTS.branch-aware.md`](examples/AGENTS.branch-aware.md) — copy it to
+the analyzed project as `AGENTS.md` or `.github/copilot-instructions.md`.
+
 
 ### 3. Result Interpretation
 - Follow prompt guidance for interpreting results

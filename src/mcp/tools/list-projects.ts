@@ -6,6 +6,28 @@ export interface ListProjectsParams {
   limit?: number;
 }
 
+/**
+ * Groups project snapshots by their base project id and lists the indexed branches
+ * per base. Helps the AI discover which branches actually exist before querying.
+ */
+function groupByBase(projects: any[]) {
+  const map = new Map<string, { base_project_id: string; name?: string; branches: string[] }>();
+  for (const p of projects) {
+    const parsed = Neo4jClient.parseProjectId(p.project_id);
+    const base = p.base_project_id || parsed.base;
+    const branch = p.branch || parsed.branch;
+    if (!map.has(base)) {
+      map.set(base, { base_project_id: base, name: p.name, branches: [] });
+    }
+    const entry = map.get(base)!;
+    if (!entry.branches.includes(branch)) entry.branches.push(branch);
+  }
+  return Array.from(map.values()).map(e => ({
+    ...e,
+    branches: e.branches.sort()
+  }));
+}
+
 export async function listProjects(
   neo4jClient: Neo4jClient,
   params: ListProjectsParams = {}
@@ -21,6 +43,7 @@ export async function listProjects(
       const sortedProjects = sortProjects(projects, sort_by);
       return {
         projects: sortedProjects.slice(0, limit),
+        bases: groupByBase(projects),
         total_count: projects.length
       };
     }
@@ -40,6 +63,7 @@ export async function listProjects(
     
     return {
       projects: sortedProjects.slice(0, limit),
+      bases: groupByBase(projects),
       total_count: projects.length,
       summary: {
         total_projects: projects.length,

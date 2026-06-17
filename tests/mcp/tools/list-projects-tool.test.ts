@@ -13,6 +13,14 @@ describe('List Projects Tool', () => {
       listProjects: jest.fn(),
       runQuery: jest.fn()
     } as jest.Mocked<Neo4jClient>;
+
+    // The module is auto-mocked, which also mocks the static parseProjectId used by
+    // groupByBase. Restore real branch-parsing behavior so grouping works in tests.
+    (Neo4jClient.parseProjectId as unknown as jest.Mock).mockImplementation((projectId: string) => {
+      const idx = projectId.lastIndexOf('@');
+      if (idx === -1) return { base: projectId, branch: 'main' };
+      return { base: projectId.slice(0, idx), branch: projectId.slice(idx + 1) || 'main' };
+    });
   });
 
   afterEach(() => {
@@ -206,6 +214,28 @@ describe('List Projects Tool', () => {
 
       expect(result.projects).toHaveLength(0);
       expect(result.total_count).toBe(0);
+    });
+
+    test('should group branch variants under their base project', async () => {
+      const mockProjects: ProjectContext[] = [
+        { project_id: 'owner/repo', name: 'Repo (main)' },
+        { project_id: 'owner/repo@develop', name: 'Repo (develop)' },
+        { project_id: 'owner/other', name: 'Other' }
+      ];
+
+      mockClient.listProjects.mockResolvedValue(mockProjects);
+
+      const result = await listProjects(mockClient, {});
+
+      expect(result.total_count).toBe(3);
+      expect(result.bases).toHaveLength(2);
+
+      const repoBase = result.bases.find((b: any) => b.base_project_id === 'owner/repo');
+      expect(repoBase).toBeDefined();
+      expect(repoBase?.branches).toEqual(['develop', 'main']);
+
+      const otherBase = result.bases.find((b: any) => b.base_project_id === 'owner/other');
+      expect(otherBase?.branches).toEqual(['main']);
     });
 
     test('should handle errors gracefully', async () => {

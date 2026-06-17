@@ -71,6 +71,7 @@ Ready to enhance your development workflow with intelligent code analysis? Our c
 
 ### Multi-Project Management
 - **Project Isolation** - Separate analysis for different codebases with unified management
+- **Branch Support** - Hold multiple branches of the same codebase in parallel (`--branch`), with automatic branch fallback for non-indexed feature branches
 - **Cross-Project Analysis** - Compare metrics and patterns across multiple projects
 - **Remote Repository Support** - Scan public and private repositories from GitHub, GitLab, and Bitbucket directly
 - **Bulk Operations** - Efficient scanning and analysis of multiple repositories

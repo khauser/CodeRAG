@@ -76,6 +76,10 @@ export interface ProjectContext {
   project_id: string;
   name?: string;
   description?: string;
+  /** Branch this project snapshot represents (derived from the project_id suffix). */
+  branch?: string;
+  /** Base project id without the branch suffix. */
+  base_project_id?: string;
   created_at?: Date;
   updated_at?: Date;
 }

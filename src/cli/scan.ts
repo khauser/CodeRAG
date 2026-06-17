@@ -4,7 +4,7 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getConfig } from '../config.js';
-import { Neo4jClient } from '../graph/neo4j-client.js';
+import { Neo4jClient, DEFAULT_BRANCH } from '../graph/neo4j-client.js';
 import { CodebaseScanner } from '../scanner/codebase-scanner.js';
 import { MetricsManager } from '../analysis/metrics-manager.js';
 import { ScanConfig, Language } from '../scanner/types.js';
@@ -38,22 +38,28 @@ program
   .option('--include-tests', 'Include test files in the scan', false)
   .option('--clear-graph', 'Clear existing graph data for this project before scanning', false)
   .option('--clear-all', 'Clear ALL graph data (all projects) before scanning', false)
+  .option('--reindex', 'Atomic blue-green reindex: scan into a temporary project, then swap it into the target project_id only after a successful scan (no query downtime, safe to abort). Recommended for refreshing an existing branch.', false)
+  .option('-y, --yes', 'Skip safety confirmations (e.g. --clear-all on a non-default branch)', false)
   .option('--analyze', 'Run quality analysis after scanning', false)
   .option('--output-report', 'Generate and save a scan report', false)
   .option('--validate-only', 'Only validate the project structure without scanning', false)
-  .option('--branch <branch>', 'Git branch to scan (for remote repositories)', 'main')
+  .option('--branch <branch>', 'Branch to index. Folded into the project_id so Neo4j can hold multiple branches in parallel (default "main" = no suffix). Also used as the checkout branch for remote repos.', 'main')
   .option('--no-cleanup', 'Keep temporary files after scanning (for debugging)')
   .option('--use-cache', 'Enable repository caching for faster subsequent scans', false)
   .option('--clear-cache', 'Clear git repository cache before scanning', false)
   .option('--no-embeddings', 'Skip automatic embedding generation after scan')
   .option('-v, --verbose', 'Show detailed progress information', false)
   .action(async (projectPath: string, options) => {
+    // Tracks the temporary project_id created for an atomic --reindex so it can be
+    // cleaned up if the scan fails before the swap completes.
+    let reindexTempId: string | null = null;
+    let client: Neo4jClient | null = null;
     try {
       console.log(`🚀 CodeRAG Scanner v1.0.0`);
 
       // Initialize Neo4j connection first for git URL validation
       const config = getConfig();
-      const client = new Neo4jClient(config);
+      client = new Neo4jClient(config);
       await client.connect();
       console.log(`🔗 Connected to Neo4j: ${config.uri}`);
       
@@ -209,6 +215,18 @@ program
       console.log(`📋 Project ID: ${projectId}`);
       console.log(`📋 Project Name: ${projectName}`);
 
+      // Fold the branch into the project ID so Neo4j can hold multiple branches in
+      // parallel. The default branch ("main") produces no suffix (backward compatible);
+      // any other branch becomes "<base>@<branch>" (slashes normalized to underscores).
+      const branchName = options.branch || 'main';
+      const baseProjectId = projectId;
+      projectId = Neo4jClient.composeProjectId(baseProjectId, branchName);
+      const normalizedBranch = Neo4jClient.normalizeBranch(branchName);
+      if (projectId !== baseProjectId) {
+        projectName = `${projectName} (${normalizedBranch})`;
+        console.log(`🌿 Branch: ${normalizedBranch} → project_id: ${projectId}`);
+      }
+
       // Prepare scan configuration
       const scanConfig: ScanConfig = {
         projectPath: resolvedPath,
@@ -240,8 +258,40 @@ program
       console.log(`  Include tests: ${options.includeTests ? 'yes' : 'no'}`);
       console.log(`  Exclude paths: ${excludePaths.join(', ')}`);
 
-      // Clear graph if requested
-      if (options.clearAll) {
+      // Clear graph if requested / set up atomic reindex.
+      // The branch this scan targets (default branch => no project_id suffix).
+      const targetProjectId = projectId;
+
+      if (options.reindex) {
+        // Blue-green swap: scan into a throwaway project_id, then atomically
+        // rebrand it onto the target after a successful scan. Clear flags are
+        // redundant here because the swap fully replaces the target.
+        if (options.clearAll || options.clearGraph) {
+          console.warn(`ℹ️  --clear-graph/--clear-all are ignored with --reindex (the swap replaces the target project atomically).`);
+        }
+        reindexTempId = `__coderag_reindex__${Date.now()}`;
+        console.log(`🟦 Atomic reindex enabled.`);
+        console.log(`   Building into temporary project: ${reindexTempId}`);
+        console.log(`   Target after swap:               ${targetProjectId}`);
+        // Make sure no stale temp data exists from a previous aborted run.
+        await scanner.clearGraph(reindexTempId);
+        scanConfig.projectId = reindexTempId;
+        scanConfig.projectName = projectName;
+      } else if (options.clearAll) {
+        // Guard against the common mistake of wiping the ENTIRE database
+        // (all projects AND all branches) while indexing a specific branch.
+        if (normalizedBranch !== DEFAULT_BRANCH && !options.yes) {
+          console.error(`\n❌ Refusing --clear-all while indexing branch '${normalizedBranch}'.`);
+          console.error(`   --clear-all deletes ALL projects and ALL branches, not just '${normalizedBranch}'.`);
+          console.error(`   • To replace only this branch safely, use:  --reindex   (atomic swap)`);
+          console.error(`   • To clear only this branch, use:           --clear-graph`);
+          console.error(`   • If you really mean to wipe the whole database, re-run with: --yes`);
+          await client.disconnect();
+          process.exit(1);
+        }
+        if (normalizedBranch !== DEFAULT_BRANCH) {
+          console.warn(`⚠️  --clear-all is wiping the ENTIRE database (all projects/branches) while indexing branch '${normalizedBranch}'.`);
+        }
         await scanner.clearGraph(); // Clear all data
       } else if (options.clearGraph) {
         await scanner.clearGraph(projectId); // Clear only this project
@@ -253,6 +303,17 @@ program
       // Perform the scan
       console.log(`\n🔄 Starting codebase scan...`);
       const result = await scanner.scanProject(scanConfig);
+
+      // Atomic reindex swap: only now that the scan succeeded do we replace the
+      // live target. Old target data is cleared, then the temp project is
+      // rebranded onto the target id (queries see no empty window).
+      if (options.reindex && reindexTempId) {
+        console.log(`\n🔁 Swapping freshly indexed data into '${targetProjectId}'...`);
+        await scanner.clearGraph(targetProjectId);
+        await client.renameProject(reindexTempId, targetProjectId);
+        reindexTempId = null; // swap done; nothing to clean up anymore
+        console.log(`✅ Swap complete. '${targetProjectId}' now serves the new index.`);
+      }
 
       // Generate and display report
       const report = await scanner.generateScanReport(result);
@@ -303,6 +364,17 @@ program
       if (options.verbose) {
         console.error(error instanceof Error ? error.stack : error);
       }
+      // Clean up the temporary reindex project so a failed run leaves no orphan.
+      if (reindexTempId && client) {
+        try {
+          console.error(`🧹 Cleaning up temporary reindex project '${reindexTempId}'...`);
+          const scanner = new CodebaseScanner(client);
+          await scanner.clearGraph(reindexTempId);
+          await client.deleteProject(reindexTempId);
+        } catch (cleanupError) {
+          console.error(`⚠️  Failed to clean up temporary project '${reindexTempId}':`, cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+        }
+      }
       process.exit(1);
     }
   });
@@ -310,29 +382,77 @@ program
 // Add a command to clear the graph
 program
   .command('clear')
-  .description('Clear all data from the CodeRAG graph database')
+  .description(`Clear data from the CodeRAG graph database
+
+Scope:
+  • No options              → clears the ENTIRE database (all projects & branches)
+  • --project-id <id>       → clears only that project (default branch)
+  • --project-id <id> --branch <b> → clears only that project's branch (project_id "<id>@<b>")
+
+Examples:
+  coderag-scan clear --force
+  coderag-scan clear -p icm-as --force
+  coderag-scan clear -p icm-as --branch develop --force`)
+  .option('-p, --project-id <id>', 'Clear only this project (branch-aware when combined with --branch)')
+  .option('--branch <branch>', 'Branch to clear. Folded into the project_id (default "main" = no suffix). Requires --project-id.')
   .option('-f, --force', 'Force clear without confirmation', false)
   .action(async (options) => {
+    let client: Neo4jClient | null = null;
     try {
-      if (!options.force) {
-        console.log(`⚠️  This will permanently delete all data in your CodeRAG graph database.`);
-        console.log(`Use --force flag to confirm this action.`);
+      if (options.branch && !options.projectId) {
+        console.error(`❌ --branch requires --project-id (it scopes the clear to a specific project's branch).`);
         process.exit(1);
       }
 
       const config = getConfig();
-      const client = new Neo4jClient(config);
+      client = new Neo4jClient(config);
       await client.connect();
 
       const scanner = new CodebaseScanner(client);
-      await scanner.clearGraph();
 
-      console.log(`✅ Graph database cleared successfully.`);
+      // Determine the scope of the clear: whole DB vs. a single (branch-aware) project.
+      let targetProjectId: string | undefined;
+      let scopeDescription: string;
+
+      if (options.projectId) {
+        const resolved = await client.resolveProjectAndBranch(options.projectId, options.branch);
+        targetProjectId = resolved.projectId;
+        if (!resolved.available) {
+          console.warn(`⚠️  No indexed data found for "${options.projectId}"${options.branch ? ` (branch "${options.branch}")` : ''}. Nothing may be deleted.`);
+        } else if (resolved.fallbackUsed) {
+          // The requested branch isn't indexed; resolution fell back to another branch.
+          // Refuse to silently clear a DIFFERENT branch than the user asked for.
+          console.error(`\n❌ Branch "${resolved.requestedBranch}" is not indexed for "${resolved.base}".`);
+          console.error(`   Refusing to clear the fallback branch "${resolved.resolvedBranch}" instead.`);
+          console.error(`   Available indexed project_id resolved to: ${resolved.projectId}`);
+          console.error(`   Re-run with the exact --branch that exists, or omit --branch to target the default branch.`);
+          await client.disconnect();
+          process.exit(1);
+        }
+        scopeDescription = `project "${targetProjectId}"`;
+      } else {
+        scopeDescription = `the ENTIRE database (all projects & branches)`;
+      }
+
+      if (!options.force) {
+        console.log(`⚠️  This will permanently delete ${scopeDescription}.`);
+        console.log(`Use --force flag to confirm this action.`);
+        await client.disconnect();
+        process.exit(1);
+      }
+
+      // clearGraph(undefined) wipes everything; clearGraph(projectId) scopes to one project.
+      await scanner.clearGraph(targetProjectId);
+
+      console.log(`✅ Cleared ${scopeDescription}.`);
       client.disconnect().catch(() => {}).finally(() => process.exit(0));
       setTimeout(() => process.exit(0), 3000);
 
     } catch (error) {
       console.error(`❌ Failed to clear graph:`, error instanceof Error ? error.message : String(error));
+      if (client) {
+        await client.disconnect().catch(() => {});
+      }
       process.exit(1);
     }
   });
@@ -384,8 +504,10 @@ Environment variables for embedding configuration:
 Examples:
   coderag-scan embeddings                           # Update all embeddings
   coderag-scan embeddings -p my-project             # Update embeddings for specific project
-  coderag-scan embeddings --types class,interface   # Only embed classes and interfaces`)
+  coderag-scan embeddings --types class,interface   # Only embed classes and interfaces
+  coderag-scan embeddings -p icm-as --branch develop # Only embed a specific branch`)
   .option('-p, --project-id <id>', 'Project ID to scope the embedding update to')
+  .option('--branch <branch>', 'Branch to scope the embedding update to. Folded into the project_id (default "main" = no suffix). Requires --project-id.')
   .option('-t, --types <types>', 'Comma-separated list of node types to embed (class,interface,enum,function,method)')
   .action(async (options) => {
     try {
@@ -429,9 +551,28 @@ Examples:
         console.log(`📋 Entity types: ${nodeTypes.join(', ')}`);
       }
 
+      // Resolve the branch-aware project_id when a project is scoped.
+      let targetProjectId: string | undefined = options.projectId;
+      if (options.branch && !options.projectId) {
+        console.error(`❌ --branch requires --project-id (it scopes the embedding update to a specific project's branch).`);
+        await client.disconnect();
+        process.exit(1);
+      }
+      if (options.projectId) {
+        const resolved = await client.resolveProjectAndBranch(options.projectId, options.branch);
+        targetProjectId = resolved.projectId;
+        if (resolved.fallbackUsed) {
+          console.warn(`⚠️  Branch "${resolved.requestedBranch}" is not indexed for "${resolved.base}". Falling back to "${resolved.resolvedBranch}".`);
+        }
+        if (!resolved.available) {
+          console.warn(`⚠️  No indexed data found for "${options.projectId}"${options.branch ? ` (branch "${options.branch}")` : ''}. Embedding update may affect nothing.`);
+        }
+        console.log(`🎯 Target project_id: ${targetProjectId}`);
+      }
+
       // Update embeddings
       const result = await semanticSearchManager.updateEmbeddings(
-        options.projectId,
+        targetProjectId,
         nodeTypes
       );
 

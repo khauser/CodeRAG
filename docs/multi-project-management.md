@@ -34,6 +34,159 @@ npm run scan /path/to/python-service
 - **Automatic Naming**: Uses project name from build files, falls back to directory name
 - **Version Tracking**: Extracts version information from build files
 
+## Branch Support
+
+CodeRAG can hold **multiple branches of the same codebase in parallel**. A branch is
+folded into the `project_id` as a suffix, so the entire graph- and query-layer scopes
+to it automatically — no schema changes required.
+
+### How branches are encoded
+
+| Branch | Stored `project_id` |
+| ------ | ------------------- |
+| `main` (default) | `intershop-com/Products-icm-as` (no suffix) |
+| `develop` | `intershop-com/Products-icm-as@develop` |
+| `feature/CR-1234` | `intershop-com/Products-icm-as@feature_CR-1234` |
+
+- Separator is `@`. Slashes in branch names are normalized to `_` so parsing stays
+  unambiguous.
+- The default branch (`main`) produces **no suffix** → fully backward compatible with
+  existing single-branch graphs.
+
+### Indexing a specific branch
+
+Pass `--branch` to the scanner. Only **long-lived branches** (`main`, `develop`,
+`release/*`) should be indexed — feature branches change too often and their diff is
+read directly from the working tree by the AI.
+
+```bash
+# Index the develop branch of a local checkout
+npm run scan /mnt/d/Arbeit/icm/icm-as -- \
+  --branch develop \
+  --languages java \
+  --clear-graph \
+  --no-embeddings
+
+# Index main (default) — no suffix, behaves like before
+npm run scan /mnt/d/Arbeit/icm/icm-as -- --languages java
+```
+
+`--clear-graph` only clears the branch-specific `project_id`, so branches can be
+re-indexed or deleted independently.
+
+### Refreshing a branch safely (atomic blue-green reindex)
+
+Re-indexing a large project with `--clear-graph` first deletes the existing data and
+then rebuilds it, leaving a window where queries return nothing (and a failed scan
+leaves the project half-empty). Use `--reindex` instead for an **atomic swap**:
+
+```bash
+# Rebuild the develop branch without any query downtime
+npm run scan /mnt/d/Arbeit/icm/icm-as -- \
+  --branch develop \
+  --languages java \
+  --reindex \
+  --no-embeddings
+```
+
+How it works:
+
+1. The scan writes into a throwaway project (`__coderag_reindex__<timestamp>`).
+2. Only **after** the scan succeeds, the old `project_id` is cleared and the temp
+   project is atomically rebranded onto it (`renameProject`).
+3. If the scan fails, the temp project is cleaned up and the live data is untouched.
+
+`--clear-graph` / `--clear-all` are ignored together with `--reindex` because the swap
+already replaces the target. Embeddings generated during the scan move with the swap,
+so `--reindex` works with or without `--no-embeddings`.
+
+> ⚠️ **`--clear-all` wipes the ENTIRE database** (all projects *and* all branches), not
+> just the branch you are indexing. To prevent accidents, the scanner **refuses**
+> `--clear-all` while indexing a non-default branch unless you pass `--yes`. For a
+> single-branch refresh use `--reindex` (recommended) or `--clear-graph`.
+
+### Deleting a project or a single branch (`clear` command)
+
+The standalone `clear` command is branch-aware and can target the whole database, a
+single project, or just one branch of a project:
+
+```bash
+# Delete only the develop branch of a project (project_id "…@develop")
+npm run scan clear -- -p icm-as --branch develop --force
+
+# Delete only the default branch (main) of a project
+npm run scan clear -- -p icm-as --force
+
+# Delete the ENTIRE database (all projects & branches) — unchanged behaviour
+npm run scan clear -- --force
+```
+
+Scope resolution:
+
+| Options | Scope |
+| ------- | ----- |
+| *(none)* | The entire database (all projects & branches) |
+| `--project-id <id>` | Only that project's **default** branch |
+| `--project-id <id> --branch <b>` | Only that project's branch (`<id>@<b>`) |
+
+Safety guarantees:
+
+- **No silent fallback.** Unlike query tools, `clear` does **not** fall back to another
+  branch. If the requested `--branch` is not indexed, the command **aborts** instead of
+  deleting a different (fallback) branch.
+- `--branch` requires `--project-id` (otherwise the scope would be ambiguous).
+- Without `--force`, the command prints exactly what would be deleted and exits.
+- An empty match prints a `⚠️ No indexed data found …` warning.
+
+### How a query finds the right branch
+
+When the AI calls a tool, it should pass the **current local Git branch** via the
+optional `branch` parameter. The server resolves it as follows:
+
+1. **Effective branch** = `branch` argument → `CODERAG_DEFAULT_BRANCH` env → `main`.
+2. The base project is matched (so `"icm-as"` stays unambiguous even with multiple
+   branch variants), then the matching branch variant is selected.
+3. If that branch is **not indexed** (typical for feature branches), the server walks
+   the **fallback chain** `CODERAG_BRANCH_FALLBACKS` (e.g. `develop,main`).
+4. The tool response is prefixed with a transparent notice telling the AI which branch
+   actually served the data, e.g.:
+   `⚠️ Branch 'feature/CR-1234' is not indexed for project 'icm-as'. Returned data is
+   from branch 'develop' instead.`
+
+This means the large, stable context comes from the integration branch, while the
+small feature diff is read by the AI from the local files.
+
+### Deployment configuration
+
+Each per-branch MCP deployment can set its own default and fallback chain via
+environment variables (wired through the Bicep parameters `defaultBranch` /
+`branchFallbacks`):
+
+| Env var | Purpose | Example |
+| ------- | ------- | ------- |
+| `CODERAG_DEFAULT_BRANCH` | Branch served when a tool call provides none | `develop` |
+| `CODERAG_BRANCH_FALLBACKS` | Comma-separated fallback chain | `develop,main` |
+
+So a `develop`-URL deployment and a `main`-URL deployment can point at the same Neo4j
+instance while serving different branches.
+
+### Discovering indexed branches
+
+`list_projects` groups results by base project and lists the available branches under
+`bases`, so the AI can check what is actually indexed before querying:
+
+```json
+{
+  "bases": [
+    {
+      "base_project_id": "intershop-com/Products-icm-as",
+      "name": "icm-as",
+      "branches": ["develop", "main"]
+    }
+  ]
+}
+```
+
 ## Managing Multiple Projects
 
 ### 1. Scanning Multiple Projects with Auto-Detection

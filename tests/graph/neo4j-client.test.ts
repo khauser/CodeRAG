@@ -27,7 +27,7 @@ jest.mock('neo4j-driver', () => ({
   default: mockNeo4j
 }));
 
-import { Neo4jClient } from '../../src/graph/neo4j-client.js';
+import { Neo4jClient, DEFAULT_BRANCH } from '../../src/graph/neo4j-client.js';
 import { ProjectContext } from '../../src/types.js';
 
 describe('Neo4jClient', () => {
@@ -72,7 +72,16 @@ describe('Neo4jClient', () => {
   describe('connect', () => {
     test('should connect successfully', async () => {
       await client.connect();
-      expect(mockNeo4j.driver).toHaveBeenCalledWith('bolt://localhost:7687', {});
+      expect(mockNeo4j.driver).toHaveBeenCalledWith(
+        'bolt://localhost:7687',
+        {},
+        expect.objectContaining({
+          maxConnectionPoolSize: 50,
+          connectionAcquisitionTimeout: 60_000,
+          connectionTimeout: 20_000,
+          maxConnectionLifetime: 60 * 60 * 1000
+        })
+      );
       expect(mockDriver.verifyConnectivity).toHaveBeenCalled();
     });
 
@@ -247,6 +256,50 @@ describe('Neo4jClient', () => {
     });
   });
 
+  describe('renameProject (atomic swap)', () => {
+    test('should no-op when ids are equal or empty', async () => {
+      await client.connect();
+      mockSession.run.mockClear();
+      await client.renameProject('same', 'same');
+      await client.renameProject('', 'target');
+      await client.renameProject('source', '');
+      expect(mockSession.run).not.toHaveBeenCalled();
+    });
+
+    test('should rebrand nodes/edges and move the ProjectContext to the new id', async () => {
+      await client.connect();
+
+      const upd = (n: number) => ({ records: [{ get: () => ({ toNumber: () => n }) }] });
+      mockSession.run
+        .mockResolvedValueOnce({ records: [] })   // delete stale target context
+        .mockResolvedValueOnce(upd(5))            // CodeNode batch 1
+        .mockResolvedValueOnce(upd(0))            // CodeNode batch 2 (done)
+        .mockResolvedValueOnce(upd(3))            // CodeEdge batch 1
+        .mockResolvedValueOnce(upd(0))            // CodeEdge batch 2 (done)
+        .mockResolvedValueOnce({ records: [] });  // move ProjectContext
+
+      await client.renameProject('__coderag_reindex__123', 'owner-repo@develop');
+
+      const calls = mockSession.run.mock.calls.map((c: any[]) => c[0] as string);
+      expect(calls[0]).toMatch(/MATCH \(p:ProjectContext \{project_id: \$newId\}\) DELETE p/);
+      expect(calls.some((q: string) => q.includes('MATCH (n:CodeNode {project_id: $oldId})'))).toBe(true);
+      expect(calls.some((q: string) => q.includes('MATCH (n:CodeEdge {project_id: $oldId})'))).toBe(true);
+
+      const moveQuery = calls[calls.length - 1];
+      expect(moveQuery).toMatch(/SET p.project_id = \$newId/);
+      expect(moveQuery).toMatch(/p.base_project_id = \$base/);
+      expect(moveQuery).toMatch(/p.branch = \$branch/);
+
+      const moveParams = mockSession.run.mock.calls[mockSession.run.mock.calls.length - 1][1];
+      expect(moveParams).toEqual(expect.objectContaining({
+        oldId: '__coderag_reindex__123',
+        newId: 'owner-repo@develop',
+        base: 'owner-repo',
+        branch: 'develop'
+      }));
+    });
+  });
+
   describe('utility methods', () => {
     test('should generate project label', () => {
       const label = client.getProjectLabel('test-project', 'class');
@@ -320,6 +373,205 @@ describe('Neo4jClient', () => {
       const resolved = await client.resolveProjectId('cached-project');
       expect(resolved).toBe('cached-project');
       expect(mockSession.run.mock.calls.length).toBe(callCount);
+    });
+  });
+
+  describe('branch helpers', () => {
+    describe('normalizeBranch', () => {
+      test('falls back to default branch for empty/undefined input', () => {
+        expect(Neo4jClient.normalizeBranch(undefined)).toBe(DEFAULT_BRANCH);
+        expect(Neo4jClient.normalizeBranch(null)).toBe(DEFAULT_BRANCH);
+        expect(Neo4jClient.normalizeBranch('')).toBe(DEFAULT_BRANCH);
+        expect(Neo4jClient.normalizeBranch('   ')).toBe(DEFAULT_BRANCH);
+      });
+
+      test('maps slashes to underscores and trims', () => {
+        expect(Neo4jClient.normalizeBranch('feature/CR-1234')).toBe('feature_CR-1234');
+        expect(Neo4jClient.normalizeBranch('  release/2024/q1  ')).toBe('release_2024_q1');
+      });
+
+      test('leaves simple branch names unchanged', () => {
+        expect(Neo4jClient.normalizeBranch('develop')).toBe('develop');
+      });
+    });
+
+    describe('composeProjectId', () => {
+      test('produces no suffix for the default branch (backward compatible)', () => {
+        expect(Neo4jClient.composeProjectId('owner/repo')).toBe('owner/repo');
+        expect(Neo4jClient.composeProjectId('owner/repo', DEFAULT_BRANCH)).toBe('owner/repo');
+      });
+
+      test('appends the normalized branch as a suffix', () => {
+        expect(Neo4jClient.composeProjectId('owner/repo', 'develop')).toBe('owner/repo@develop');
+        expect(Neo4jClient.composeProjectId('owner/repo', 'feature/x')).toBe('owner/repo@feature_x');
+      });
+    });
+
+    describe('parseProjectId', () => {
+      test('treats an id without suffix as the default branch', () => {
+        expect(Neo4jClient.parseProjectId('owner/repo')).toEqual({ base: 'owner/repo', branch: DEFAULT_BRANCH });
+      });
+
+      test('splits a composed id into base and branch', () => {
+        expect(Neo4jClient.parseProjectId('owner/repo@develop')).toEqual({ base: 'owner/repo', branch: 'develop' });
+      });
+
+      test('uses the last separator so bases with @ are handled', () => {
+        expect(Neo4jClient.parseProjectId('a@b@develop')).toEqual({ base: 'a@b', branch: 'develop' });
+      });
+
+      test('round-trips with composeProjectId', () => {
+        const id = Neo4jClient.composeProjectId('owner/repo', 'feature/x');
+        expect(Neo4jClient.parseProjectId(id)).toEqual({ base: 'owner/repo', branch: 'feature_x' });
+      });
+    });
+
+    describe('getDefaultBranch', () => {
+      const original = process.env.CODERAG_DEFAULT_BRANCH;
+      afterEach(() => {
+        if (original === undefined) delete process.env.CODERAG_DEFAULT_BRANCH;
+        else process.env.CODERAG_DEFAULT_BRANCH = original;
+      });
+
+      test('returns "main" when env is not set', () => {
+        delete process.env.CODERAG_DEFAULT_BRANCH;
+        expect(Neo4jClient.getDefaultBranch()).toBe('main');
+      });
+
+      test('honors CODERAG_DEFAULT_BRANCH and normalizes it', () => {
+        process.env.CODERAG_DEFAULT_BRANCH = 'release/2024';
+        expect(Neo4jClient.getDefaultBranch()).toBe('release_2024');
+      });
+    });
+
+    describe('getBranchFallbacks', () => {
+      const original = process.env.CODERAG_BRANCH_FALLBACKS;
+      afterEach(() => {
+        if (original === undefined) delete process.env.CODERAG_BRANCH_FALLBACKS;
+        else process.env.CODERAG_BRANCH_FALLBACKS = original;
+      });
+
+      test('defaults to develop,main', () => {
+        delete process.env.CODERAG_BRANCH_FALLBACKS;
+        expect(Neo4jClient.getBranchFallbacks()).toEqual(['develop', 'main']);
+      });
+
+      test('parses a comma-separated list and always ends with the default branch', () => {
+        process.env.CODERAG_BRANCH_FALLBACKS = 'staging, release/x';
+        expect(Neo4jClient.getBranchFallbacks()).toEqual(['staging', 'release_x', 'main']);
+      });
+
+      test('does not duplicate the default branch when already present', () => {
+        process.env.CODERAG_BRANCH_FALLBACKS = 'develop,main';
+        expect(Neo4jClient.getBranchFallbacks()).toEqual(['develop', 'main']);
+      });
+    });
+  });
+
+  describe('resolveProjectAndBranch', () => {
+    const originalDefault = process.env.CODERAG_DEFAULT_BRANCH;
+    const originalFallbacks = process.env.CODERAG_BRANCH_FALLBACKS;
+
+    afterEach(() => {
+      if (originalDefault === undefined) delete process.env.CODERAG_DEFAULT_BRANCH;
+      else process.env.CODERAG_DEFAULT_BRANCH = originalDefault;
+      if (originalFallbacks === undefined) delete process.env.CODERAG_BRANCH_FALLBACKS;
+      else process.env.CODERAG_BRANCH_FALLBACKS = originalFallbacks;
+    });
+
+    function mockKnownProjects(ids: string[]) {
+      jest.spyOn(client, 'getKnownProjectIds').mockResolvedValue(ids);
+    }
+
+    test('serves the requested branch when it is indexed', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('icm-as', 'develop');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as@develop');
+      expect(result.base).toBe('intershop-com/Products-icm-as');
+      expect(result.requestedBranch).toBe('develop');
+      expect(result.resolvedBranch).toBe('develop');
+      expect(result.fallbackUsed).toBe(false);
+      expect(result.available).toBe(true);
+      expect(result.availableBranches).toEqual(['develop', 'main']);
+    });
+
+    test('resolves the default branch (no suffix) when no branch is requested', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('icm-as');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as');
+      expect(result.requestedBranch).toBe('main');
+      expect(result.resolvedBranch).toBe('main');
+      expect(result.fallbackUsed).toBe(false);
+      expect(result.available).toBe(true);
+    });
+
+    test('falls back when the requested feature branch is not indexed', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      delete process.env.CODERAG_BRANCH_FALLBACKS; // -> develop, main
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('icm-as', 'feature/CR-1234');
+      expect(result.requestedBranch).toBe('feature_CR-1234');
+      expect(result.resolvedBranch).toBe('develop');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as@develop');
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.available).toBe(true);
+    });
+
+    test('falls back to main when develop is not indexed', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      delete process.env.CODERAG_BRANCH_FALLBACKS;
+      mockKnownProjects(['intershop-com/Products-icm-as']);
+
+      const result = await client.resolveProjectAndBranch('icm-as', 'feature/x');
+      expect(result.resolvedBranch).toBe('main');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as');
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.available).toBe(true);
+    });
+
+    test('accepts a fully composed id with an inline branch', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('intershop-com/Products-icm-as@develop');
+      expect(result.resolvedBranch).toBe('develop');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as@develop');
+      expect(result.fallbackUsed).toBe(false);
+    });
+
+    test('explicit branch arg overrides an inline branch', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('intershop-com/Products-icm-as@develop', 'main');
+      expect(result.requestedBranch).toBe('main');
+      expect(result.resolvedBranch).toBe('main');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as');
+    });
+
+    test('honors CODERAG_DEFAULT_BRANCH when no branch is requested', async () => {
+      process.env.CODERAG_DEFAULT_BRANCH = 'develop';
+      mockKnownProjects(['intershop-com/Products-icm-as', 'intershop-com/Products-icm-as@develop']);
+
+      const result = await client.resolveProjectAndBranch('icm-as');
+      expect(result.requestedBranch).toBe('develop');
+      expect(result.resolvedBranch).toBe('develop');
+      expect(result.projectId).toBe('intershop-com/Products-icm-as@develop');
+    });
+
+    test('reports unavailable when no branch variant is indexed', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      delete process.env.CODERAG_BRANCH_FALLBACKS;
+      mockKnownProjects(['some-other/project@develop']);
+
+      const result = await client.resolveProjectAndBranch('unknown', 'feature/x');
+      expect(result.available).toBe(false);
+      expect(result.resolvedBranch).toBe('feature_x');
     });
   });
 });

@@ -7,7 +7,7 @@ import {
   McpError,
   ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
-import { Neo4jClient } from '../graph/neo4j-client.js';
+import { Neo4jClient, ResolvedProject } from '../graph/neo4j-client.js';
 import { NodeManager } from '../graph/node-manager.js';
 import { EdgeManager } from '../graph/edge-manager.js';
 import { MetricsManager } from '../analysis/metrics-manager.js';
@@ -66,12 +66,22 @@ export abstract class BaseHandler {
   protected detailLevel: 'simple' | 'detailed' = 'detailed';
 
   /**
-   * Resolves a user-provided project identifier to the actual project_id in the database.
-   * E.g., "icm-as" → "intershop-com/Products-icm-as"
+   * Branch resolution of the most recent resolveProject() call in the current tool
+   * invocation. Used to append a transparency notice when a branch fallback was used.
    */
-  protected async resolveProject(userProject: string | undefined): Promise<string> {
+  protected lastBranchResolution?: ResolvedProject;
+
+  /**
+   * Resolves a user-provided project identifier (and optional branch) to the actual
+   * project_id in the database. E.g., "icm-as" + branch "develop" →
+   * "intershop-com/Products-icm-as@develop". Stores the full resolution so the tool
+   * dispatcher can surface a fallback notice.
+   */
+  protected async resolveProject(userProject: string | undefined, branch?: string): Promise<string> {
     if (!userProject) return '';
-    return this.client.resolveProjectId(userProject);
+    const resolved = await this.client.resolveProjectAndBranch(userProject, branch);
+    this.lastBranchResolution = resolved;
+    return resolved.projectId;
   }
 
   constructor(
@@ -113,6 +123,46 @@ export abstract class BaseHandler {
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
+        // Reset per-call branch resolution; handlers set it via resolveProject().
+        this.lastBranchResolution = undefined;
+        const result = await this.dispatchTool(request);
+        return this.withBranchNotice(result);
+      } catch (error) {
+        if (error instanceof McpError) {
+          throw error;
+        }
+        throw new McpError(ErrorCode.InternalError, `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+  }
+
+  /**
+   * Appends a transparency notice to a tool result when the requested branch was not
+   * indexed and a fallback branch served the data instead.
+   */
+  protected withBranchNotice(result: any): any {
+    const info = this.lastBranchResolution;
+    if (!info) return result;
+
+    let notice: string | undefined;
+    if (info.fallbackUsed) {
+      notice = `⚠️ Branch '${info.requestedBranch}' is not indexed for project '${info.base}'. ` +
+        `Returned data is from branch '${info.resolvedBranch}' instead. ` +
+        `Indexed branches: ${info.availableBranches.join(', ') || '(none)'}.`;
+    } else if (!info.available && info.base) {
+      notice = `⚠️ No indexed data found for project '${info.base}' on branch '${info.requestedBranch}'. ` +
+        `Indexed branches: ${info.availableBranches.join(', ') || '(none)'}.`;
+    }
+
+    if (!notice) return result;
+    if (result && Array.isArray(result.content)) {
+      result.content = [{ type: 'text', text: notice }, ...result.content];
+    }
+    return result;
+  }
+
+  private async dispatchTool(request: any): Promise<any> {
+    {
         switch (request.params.name) {
           case 'add_node':
             return await this.handleAddNode(request.params.arguments);
@@ -128,6 +178,7 @@ export abstract class BaseHandler {
             // Alias for search_nodes - converts class_name to search_term
             return await this.handleSearchNodes({
               project: request.params.arguments?.project,
+              branch: request.params.arguments?.branch,
               search_term: request.params.arguments?.class_name,
               limit: 10
             });
@@ -193,13 +244,7 @@ export abstract class BaseHandler {
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
         }
-      } catch (error) {
-        if (error instanceof McpError) {
-          throw error;
-        }
-        throw new McpError(ErrorCode.InternalError, `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    });
+    }
   }
 
   protected setupPromptHandlers(): void {
@@ -273,7 +318,7 @@ export abstract class BaseHandler {
   }
 
   protected getToolSchemas() {
-    return [
+    const tools: any[] = [
       {
         name: 'add_node',
         description: 'Add a new code node (class, interface, method, etc.) to the graph',
@@ -981,6 +1026,22 @@ export abstract class BaseHandler {
       },
       ...createRemoteScannerTools(this.client)
     ];
+
+    // Add an optional `branch` parameter to every project-scoped tool so the AI can
+    // pass the current local Git branch. Resolution falls back to the server default
+    // and an indexed branch when the requested branch is not present.
+    const branchProp = {
+      type: 'string',
+      description: 'Optional: Git branch to query (e.g. the current local branch like "develop" or "feature/CR-1234"). ' +
+        'If the branch is not indexed, the server falls back to the default/indexed branch and notes which branch served the data.'
+    };
+    for (const tool of tools) {
+      const props = tool?.inputSchema?.properties;
+      if (props && (props.project || props.project_id) && !props.branch) {
+        props.branch = branchProp;
+      }
+    }
+    return tools;
   }
 
   // Prompt response methods
@@ -1084,7 +1145,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleGetNode(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: GetNodeParams = {
       nodeId: args?.id ?? args?.nodeId,
       projectId
@@ -1101,7 +1162,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindNodesByType(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: FindNodesByTypeParams = {
       nodeType: args?.type ?? args?.nodeType,
       projectId,
@@ -1112,7 +1173,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleSearchNodes(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: SearchNodesParams = {
       searchTerm: args?.search_term ?? args?.searchTerm,
       projectId,
@@ -1135,7 +1196,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindEdgesBySource(args: any) {
-    const project = await this.resolveProject(args?.project);
+    const project = await this.resolveProject(args?.project, args?.branch);
     const params: FindEdgesBySourceParams = {
       sourceId: args?.source_id ?? args?.sourceId,
       project
@@ -1144,7 +1205,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindClassesCallingMethod(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: FindMethodCallersParams = {
       methodName: args?.method_name ?? args?.methodName,
       projectId
@@ -1153,7 +1214,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindClassesImplementingInterface(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: FindImplementationsParams = {
       interfaceName: args?.interface_name ?? args?.interfaceName,
       projectId
@@ -1162,7 +1223,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleGetInheritanceHierarchy(args: any) {
-    const projectId = await this.resolveProject(args?.project ?? args?.projectId);
+    const projectId = await this.resolveProject(args?.project ?? args?.projectId, args?.branch);
     const params: FindInheritanceHierarchyParams = {
       className: args?.class_name ?? args?.className,
       projectId
@@ -1178,7 +1239,7 @@ export abstract class BaseHandler {
   }
 
   protected async handleListPackages(args: any) {
-    const projectId = await this.resolveProject(args?.project);
+    const projectId = await this.resolveProject(args?.project, args?.branch);
     const depth = args?.depth ?? 3;
     const packages = await this.metricsManager.listPackages(projectId, depth);
     return {
@@ -1199,12 +1260,12 @@ export abstract class BaseHandler {
   }
 
   protected async handleFindArchitecturalIssues(args: any) {
-    const project = await this.resolveProject(args?.project);
+    const project = await this.resolveProject(args?.project, args?.branch);
     return await findArchitecturalIssues(this.metricsManager, { ...args, project });
   }
 
   protected async handleGetProjectSummary(args: any) {
-    const project = args?.project ? await this.resolveProject(args.project) : undefined;
+    const project = args?.project ? await this.resolveProject(args.project, args?.branch) : undefined;
     return await getProjectSummary(this.metricsManager, { ...args, project } as GetProjectSummaryParams, this.detailLevel);
   }
 
@@ -1376,7 +1437,7 @@ What aspect of inheritance would you like to explore first?`;
 
   // Annotation analysis handler methods
   protected async handleFindNodesByAnnotation(args: any) {
-    const project = await this.resolveProject(args?.project);
+    const project = await this.resolveProject(args?.project, args?.branch);
     const result = await findNodesByAnnotation(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
@@ -1384,42 +1445,48 @@ What aspect of inheritance would you like to explore first?`;
   }
 
   protected async handleGetFrameworkUsage(args: any) {
-    const result = await getFrameworkUsage(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await getFrameworkUsage(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
   }
 
   protected async handleGetAnnotationUsage(args: any) {
-    const result = await getAnnotationUsage(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await getAnnotationUsage(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
   }
 
   protected async handleFindDeprecatedCode(args: any) {
-    const result = await findDeprecatedCode(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await findDeprecatedCode(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
   }
 
   protected async handleFindUsageOfDeprecatedCode(args: any) {
-    const result = await findUsageOfDeprecatedCode(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await findUsageOfDeprecatedCode(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
   }
 
   protected async handleAnalyzeTestingAnnotations(args: any) {
-    const result = await analyzeTestingAnnotations(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await analyzeTestingAnnotations(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
   }
 
   protected async handleFindUntestableCode(args: any) {
-    const result = await findUntestableCode(this.client, args);
+    const project = await this.resolveProject(args?.project, args?.branch);
+    const result = await findUntestableCode(this.client, { ...args, project });
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
     };
@@ -1435,7 +1502,7 @@ What aspect of inheritance would you like to explore first?`;
   protected async handleSemanticSearch(args: any) {
     const params: SemanticSearchToolParams = {
       ...args,
-      project_id: args?.project_id ? await this.resolveProject(args.project_id) : undefined
+      project_id: args?.project_id ? await this.resolveProject(args.project_id, args?.branch) : undefined
     };
     const result = await semanticSearch(this.semanticSearchManager, params);
     return {
@@ -1454,7 +1521,7 @@ What aspect of inheritance would you like to explore first?`;
   protected async handleGetSimilarCode(args: any) {
     const params: GetSimilarCodeParams = {
       ...args,
-      project_id: args?.project_id ? await this.resolveProject(args.project_id) : args?.project_id
+      project_id: args?.project_id ? await this.resolveProject(args.project_id, args?.branch) : args?.project_id
     };
     const result = await getSimilarCode(this.semanticSearchManager, params);
     return {

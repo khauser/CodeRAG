@@ -1,6 +1,34 @@
 import neo4j, { Driver, Session, Result } from 'neo4j-driver';
 import { Neo4jConfig, ProjectConfig, ProjectContext } from '../types.js';
 
+/**
+ * The branch that is stored WITHOUT a suffix in the project_id.
+ * Scanning this branch produces a plain project_id (e.g. "owner-repo"),
+ * which keeps pre-branch data fully backward compatible.
+ */
+export const DEFAULT_BRANCH = 'main';
+
+/** Separator between the base project id and the branch in a composed project_id. */
+export const BRANCH_SEPARATOR = '@';
+
+/** Result of resolving a (project, branch) pair against the graph. */
+export interface ResolvedProject {
+  /** Full project_id to query (base or base@branch). */
+  projectId: string;
+  /** Resolved base project id without branch suffix. */
+  base: string;
+  /** Branch that was requested (normalized). */
+  requestedBranch: string;
+  /** Branch that is actually served (may differ when a fallback was used). */
+  resolvedBranch: string;
+  /** True when the requested branch was not indexed and a fallback was used. */
+  fallbackUsed: boolean;
+  /** True when the resolved branch actually exists in the graph. */
+  available: boolean;
+  /** All branches that are indexed for the resolved base project. */
+  availableBranches: string[];
+}
+
 export class Neo4jClient {
   private driver: Driver | null = null;
   private projectConfig: ProjectConfig;
@@ -86,54 +114,160 @@ export class Neo4jClient {
   }
 
   /**
-   * Resolves a user-provided project identifier to the actual project_id stored in the database.
-   * Supports exact match, suffix match (e.g., "icm-as" matches "intershop-com/Products-icm-as"),
-   * and case-insensitive partial match.
+   * Normalizes a branch name so it can be safely embedded in a project_id.
+   * Slashes (e.g. "feature/CR-1234") are mapped to underscores because "/" already
+   * appears in base project ids (e.g. "owner/repo").
+   */
+  static normalizeBranch(branch: string | undefined | null): string {
+    const b = (branch || '').trim();
+    if (!b) return DEFAULT_BRANCH;
+    return b.replace(/\//g, '_');
+  }
+
+  /** Branch used when no branch is provided by the caller (env-configurable). */
+  static getDefaultBranch(): string {
+    return Neo4jClient.normalizeBranch(process.env.CODERAG_DEFAULT_BRANCH || DEFAULT_BRANCH);
+  }
+
+  /**
+   * Ordered list of fallback branches tried when the requested branch is not indexed.
+   * Configurable via CODERAG_BRANCH_FALLBACKS (comma-separated). Defaults to develop,main.
+   */
+  static getBranchFallbacks(): string[] {
+    const raw = process.env.CODERAG_BRANCH_FALLBACKS;
+    const list = raw
+      ? raw.split(',').map(b => Neo4jClient.normalizeBranch(b)).filter(Boolean)
+      : ['develop', DEFAULT_BRANCH];
+    // Ensure the default branch is always a last-resort fallback.
+    if (!list.includes(DEFAULT_BRANCH)) list.push(DEFAULT_BRANCH);
+    return list;
+  }
+
+  /**
+   * Composes a full project_id from a base id and a branch.
+   * The default branch produces no suffix (backward compatible).
+   */
+  static composeProjectId(base: string, branch?: string): string {
+    const normalized = Neo4jClient.normalizeBranch(branch);
+    if (normalized === DEFAULT_BRANCH) return base;
+    return `${base}${BRANCH_SEPARATOR}${normalized}`;
+  }
+
+  /** Splits a full project_id into its base id and branch (default branch when no suffix). */
+  static parseProjectId(projectId: string): { base: string; branch: string } {
+    const idx = projectId.lastIndexOf(BRANCH_SEPARATOR);
+    if (idx === -1) {
+      return { base: projectId, branch: DEFAULT_BRANCH };
+    }
+    return {
+      base: projectId.slice(0, idx),
+      branch: projectId.slice(idx + BRANCH_SEPARATOR.length) || DEFAULT_BRANCH
+    };
+  }
+
+  /**
+   * Resolves a user-provided project identifier (and optional branch) to the actual
+   * project_id stored in the database, honoring a branch fallback chain.
+   *
+   * Branch precedence: explicit `branch` arg → CODERAG_DEFAULT_BRANCH → "main".
+   * If the requested branch is not indexed for the resolved base project, the
+   * configured fallback branches are tried in order and `fallbackUsed` is set.
+   */
+  async resolveProjectAndBranch(userInput: string, branch?: string): Promise<ResolvedProject> {
+    // Allow callers to pass a fully composed id like "owner-repo@develop".
+    let inputBase = userInput;
+    let inlineBranch: string | undefined;
+    if (userInput && userInput.includes(BRANCH_SEPARATOR)) {
+      const parsed = Neo4jClient.parseProjectId(userInput);
+      inputBase = parsed.base;
+      inlineBranch = parsed.branch;
+    }
+
+    const requestedBranch = Neo4jClient.normalizeBranch(
+      branch || inlineBranch || Neo4jClient.getDefaultBranch()
+    );
+
+    // Build a map of base project id -> indexed branches.
+    const allProjectIds = await this.getKnownProjectIds();
+    const baseToBranches = new Map<string, Set<string>>();
+    for (const pid of allProjectIds) {
+      const { base, branch: b } = Neo4jClient.parseProjectId(pid);
+      if (!baseToBranches.has(base)) baseToBranches.set(base, new Set());
+      baseToBranches.get(base)!.add(b);
+    }
+    const bases = Array.from(baseToBranches.keys());
+
+    // Resolve the base project from the (branch-stripped) user input.
+    const resolvedBase = this.resolveBase(inputBase, bases);
+    const availableBranches = Array.from(baseToBranches.get(resolvedBase) || []).sort();
+
+    // Try the requested branch first, then the fallback chain.
+    const candidates = [requestedBranch, ...Neo4jClient.getBranchFallbacks()];
+    let resolvedBranch = requestedBranch;
+    let available = false;
+    for (const cand of candidates) {
+      if (availableBranches.includes(cand)) {
+        resolvedBranch = cand;
+        available = true;
+        break;
+      }
+    }
+
+    const projectId = Neo4jClient.composeProjectId(resolvedBase, resolvedBranch);
+    return {
+      projectId,
+      base: resolvedBase,
+      requestedBranch,
+      resolvedBranch,
+      fallbackUsed: available && resolvedBranch !== requestedBranch,
+      available,
+      availableBranches
+    };
+  }
+
+  /**
+   * Matches a (branch-stripped) user input against the set of known base project ids.
+   * Uses exact, suffix and case-insensitive contains matching. Returns the input
+   * unchanged when no match is found (results will likely be empty).
+   */
+  private resolveBase(inputBase: string, bases: string[]): string {
+    if (!inputBase) return inputBase;
+
+    // Exact base match.
+    if (bases.includes(inputBase)) return inputBase;
+
+    // Suffix match (e.g. "icm-as" matches "intershop-com/Products-icm-as").
+    const suffixMatch = bases.find(b =>
+      b.endsWith(inputBase) || b.endsWith('/' + inputBase) || b.endsWith('-' + inputBase)
+    );
+    if (suffixMatch) return suffixMatch;
+
+    // Case-insensitive contains match.
+    const lowerInput = inputBase.toLowerCase();
+    const containsMatch = bases.find(b => b.toLowerCase().includes(lowerInput));
+    if (containsMatch) return containsMatch;
+
+    return inputBase;
+  }
+
+  /**
+   * Resolves a user-provided project identifier to the actual project_id stored in
+   * the database. Branch-aware: pass an optional branch to select a specific branch
+   * variant (with fallback). Backward compatible — without a branch and with the
+   * default branch "main", the behavior is identical to the pre-branch resolver.
    * Results are cached for performance.
    */
-  async resolveProjectId(userInput: string): Promise<string> {
+  async resolveProjectId(userInput: string, branch?: string): Promise<string> {
     if (!userInput) return userInput;
 
-    // Check cache first
-    if (this.projectIdCache.has(userInput)) {
-      return this.projectIdCache.get(userInput)!;
+    const cacheKey = `${userInput}::${branch || ''}`;
+    if (this.projectIdCache.has(cacheKey)) {
+      return this.projectIdCache.get(cacheKey)!;
     }
 
-    // Try exact match first
-    const exactResult = await this.runQuery(
-      'MATCH (n:CodeNode {project_id: $pid}) RETURN n.project_id as pid LIMIT 1',
-      { pid: userInput }
-    );
-    if (exactResult.records.length > 0) {
-      this.projectIdCache.set(userInput, userInput);
-      return userInput;
-    }
-
-    // Suffix/contains match against the (cached) list of known project IDs.
-    const allProjectIds = await this.getKnownProjectIds();
-    
-    // Strategy 1: ends with the user input (e.g., "icm-as" matches "intershop-com/Products-icm-as")
-    const suffixMatch = allProjectIds.find(pid => 
-      pid.endsWith(userInput) || pid.endsWith('/' + userInput) || pid.endsWith('-' + userInput)
-    );
-    if (suffixMatch) {
-      this.projectIdCache.set(userInput, suffixMatch);
-      return suffixMatch;
-    }
-
-    // Strategy 2: contains the user input (case-insensitive)
-    const lowerInput = userInput.toLowerCase();
-    const containsMatch = allProjectIds.find(pid => 
-      pid.toLowerCase().includes(lowerInput)
-    );
-    if (containsMatch) {
-      this.projectIdCache.set(userInput, containsMatch);
-      return containsMatch;
-    }
-
-    // No match found — return as-is (will likely result in empty results)
-    this.projectIdCache.set(userInput, userInput);
-    return userInput;
+    const resolved = await this.resolveProjectAndBranch(userInput, branch);
+    this.projectIdCache.set(cacheKey, resolved.projectId);
+    return resolved.projectId;
   }
 
   /**
@@ -224,9 +358,12 @@ export class Neo4jClient {
 
   // Project management methods
   async createProject(project: ProjectContext): Promise<ProjectContext> {
+    const { base, branch } = Neo4jClient.parseProjectId(project.project_id);
     const query = `
       CREATE (p:ProjectContext {
         project_id: $project_id,
+        base_project_id: $base_project_id,
+        branch: $branch,
         name: $name,
         description: $description,
         created_at: datetime(),
@@ -237,6 +374,8 @@ export class Neo4jClient {
 
     const params = {
       project_id: project.project_id,
+      base_project_id: project.base_project_id || base,
+      branch: project.branch || branch,
       name: project.name || project.project_id,
       description: project.description || null
     };
@@ -249,6 +388,8 @@ export class Neo4jClient {
     const record = result.records[0].get('p');
     return {
       project_id: record.properties.project_id,
+      base_project_id: record.properties.base_project_id,
+      branch: record.properties.branch,
       name: record.properties.name,
       description: record.properties.description,
       created_at: record.properties.created_at.toStandardDate(),
@@ -268,8 +409,11 @@ export class Neo4jClient {
     }
 
     const record = result.records[0].get('p');
+    const parsed = Neo4jClient.parseProjectId(record.properties.project_id);
     return {
       project_id: record.properties.project_id,
+      base_project_id: record.properties.base_project_id ?? parsed.base,
+      branch: record.properties.branch ?? parsed.branch,
       name: record.properties.name,
       description: record.properties.description,
       created_at: record.properties.created_at?.toStandardDate(),
@@ -287,8 +431,11 @@ export class Neo4jClient {
     const result = await this.runQuery(query);
     return result.records.map(record => {
       const p = record.get('p');
+      const parsed = Neo4jClient.parseProjectId(p.properties.project_id);
       return {
         project_id: p.properties.project_id,
+        base_project_id: p.properties.base_project_id ?? parsed.base,
+        branch: p.properties.branch ?? parsed.branch,
         name: p.properties.name,
         description: p.properties.description,
         created_at: p.properties.created_at?.toStandardDate(),
@@ -308,6 +455,91 @@ export class Neo4jClient {
 
     const result = await this.runQuery(query, { project_id: projectId });
     return result.records[0]?.get('deleted_projects') > 0;
+  }
+
+  /**
+   * Atomically rebrands an existing project_id to a new one (blue-green swap).
+   *
+   * All CodeNode/CodeEdge nodes are re-pointed to {@link newId} in batches (cheap
+   * SET, no data movement), and the ProjectContext is moved with its derived
+   * `base_project_id`/`branch` fields refreshed from {@link newId}.
+   *
+   * The caller is responsible for ensuring the target project_id is empty
+   * (e.g. via {@link clearGraph}) before swapping, so the (project_id, id)
+   * uniqueness constraint cannot be violated. Any stale target ProjectContext
+   * is removed up-front to satisfy the unique project_id constraint.
+   */
+  async renameProject(oldId: string, newId: string): Promise<void> {
+    if (!oldId || !newId || oldId === newId) return;
+
+    const BATCH_SIZE = 5000;
+    const { base, branch } = Neo4jClient.parseProjectId(newId);
+
+    // Remove any stale ProjectContext for the target so the unique
+    // project_id constraint holds when we move the temp context over.
+    await this.runQuery(
+      'MATCH (p:ProjectContext {project_id: $newId}) DELETE p',
+      { newId }
+    );
+
+    // Rebrand nodes: match by the :CodeNode label and move them to the new id.
+    const rebrandNodes = async (): Promise<void> => {
+      let updated = 0;
+      do {
+        const res = await this.runQuery(
+          `MATCH (n:CodeNode {project_id: $oldId})
+           WITH n LIMIT ${BATCH_SIZE}
+           SET n.project_id = $newId
+           RETURN count(n) as updated`,
+          { oldId, newId }
+        );
+        updated = res.records[0]?.get('updated')?.toNumber?.() || res.records[0]?.get('updated') || 0;
+        if (updated > 0) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      } while (updated > 0);
+    };
+
+    // Rebrand relationships: in Neo4j, relationships (CALLS, IMPLEMENTS,
+    // EXTENDS, …) are NOT nodes and carry no label, so they must be matched
+    // with a relationship pattern by their project_id property. The previous
+    // implementation used a node pattern `(n:CodeEdge {...})` which never
+    // matched anything, leaving edges with the temporary reindex project_id.
+    // That broke every query that filters relationships by project_id
+    // (statistics, find_implementations, inheritance hierarchy, …).
+    const rebrandEdges = async (): Promise<void> => {
+      let updated = 0;
+      do {
+        const res = await this.runQuery(
+          `MATCH ()-[r {project_id: $oldId}]->()
+           WITH r LIMIT ${BATCH_SIZE}
+           SET r.project_id = $newId
+           RETURN count(r) as updated`,
+          { oldId, newId }
+        );
+        updated = res.records[0]?.get('updated')?.toNumber?.() || res.records[0]?.get('updated') || 0;
+        if (updated > 0) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      } while (updated > 0);
+    };
+
+    await rebrandNodes();
+    await rebrandEdges();
+
+    // Move the ProjectContext itself and refresh its derived fields.
+    await this.runQuery(
+      `MATCH (p:ProjectContext {project_id: $oldId})
+       SET p.project_id = $newId,
+           p.base_project_id = $base,
+           p.branch = $branch,
+           p.updated_at = datetime()`,
+      { oldId, newId, base, branch }
+    );
+
+    // Project-id related caches are now stale.
+    this.projectIdCache.clear();
+    this.knownProjectIds = null;
   }
 
   // Utility methods

@@ -163,3 +163,64 @@ describe('Scan CLI Options', () => {
     });
   });
 });
+
+/**
+ * Tests for the branch-aware `clear` subcommand options.
+ *
+ * These verify that Commander.js parses the clear command's scope options
+ * (--project-id / --branch / --force) the same way scan.ts defines them, which
+ * drives the whole-DB vs. single-project vs. single-branch decision.
+ */
+describe('Clear CLI Options', () => {
+  let program: Command;
+  let capturedOptions: any;
+
+  beforeEach(() => {
+    capturedOptions = null;
+
+    program = new Command();
+    program
+      .command('clear')
+      .option('-p, --project-id <id>', 'Clear only this project (branch-aware when combined with --branch)')
+      .option('--branch <branch>', 'Branch to clear. Folded into the project_id (default "main" = no suffix). Requires --project-id.')
+      .option('-f, --force', 'Force clear without confirmation', false)
+      .action((options) => {
+        capturedOptions = options;
+      });
+
+    program.exitOverride();
+  });
+
+  it('defaults to whole-database scope when no options are given', () => {
+    program.parse(['node', 'test', 'clear']);
+
+    expect(capturedOptions).toBeDefined();
+    expect(capturedOptions.projectId).toBeUndefined();
+    expect(capturedOptions.branch).toBeUndefined();
+    expect(capturedOptions.force).toBe(false);
+  });
+
+  it('scopes to a single project with --project-id', () => {
+    program.parse(['node', 'test', 'clear', '-p', 'icm-as', '--force']);
+
+    expect(capturedOptions.projectId).toBe('icm-as');
+    expect(capturedOptions.branch).toBeUndefined();
+    expect(capturedOptions.force).toBe(true);
+  });
+
+  it('scopes to a single branch with --project-id and --branch', () => {
+    program.parse(['node', 'test', 'clear', '-p', 'icm-as', '--branch', 'develop', '--force']);
+
+    expect(capturedOptions.projectId).toBe('icm-as');
+    expect(capturedOptions.branch).toBe('develop');
+    expect(capturedOptions.force).toBe(true);
+  });
+
+  it('parses --branch even without --force (confirmation path)', () => {
+    program.parse(['node', 'test', 'clear', '-p', 'icm-as', '--branch', 'feature/CR-1234']);
+
+    expect(capturedOptions.projectId).toBe('icm-as');
+    expect(capturedOptions.branch).toBe('feature/CR-1234');
+    expect(capturedOptions.force).toBe(false);
+  });
+});

@@ -4,6 +4,7 @@ import { getConfig } from './config.js';
 import { Neo4jClient } from './graph/neo4j-client.js';
 import { StdioHandler } from './mcp/stdio-handler.js';
 import { HTTPHandler } from './mcp/http-handler.js';
+import { SemanticSearchManager } from './services/semantic-search-manager.js';
 
 async function main() {
   try {
@@ -16,6 +17,18 @@ async function main() {
     await client.initializeDatabase();
     // Prime caches so the first user request doesn't hit the cold-start timeout.
     await client.warmup();
+
+    // Ensure the Neo4j vector index for semantic search exists on every startup.
+    // This is idempotent (CREATE ... IF NOT EXISTS) and guarantees that
+    // db.index.vector.queryNodes can run even if a scan or the
+    // initialize_semantic_search tool was never invoked. Failures here must not
+    // prevent the server from starting (e.g. semantic search disabled).
+    try {
+      const semanticSearchManager = new SemanticSearchManager(client);
+      await semanticSearchManager.initializeVectorIndexes();
+    } catch (error) {
+      console.error('Vector index initialization on startup failed (continuing):', error);
+    }
 
     // Determine server mode from command line arguments
     const args = process.argv.slice(2);

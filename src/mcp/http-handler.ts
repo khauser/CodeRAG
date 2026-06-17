@@ -50,7 +50,6 @@ export class HTTPHandler {
   }
 
   private server: McpServer;
-
   constructor(
     client: Neo4jClient,
     port: number = 3000,
@@ -73,6 +72,35 @@ export class HTTPHandler {
     this.setupRoutes();
   }
 
+  /**
+   * Resolves a (project, branch) pair to the stored project_id and builds a
+   * transparency notice when a branch fallback was used or no data exists.
+   */
+  private async resolveWithNotice(
+    project: string | undefined,
+    branch?: string
+  ): Promise<{ projectId: string | undefined; notice?: string }> {
+    if (!project) return { projectId: undefined };
+    const info = await this.client.resolveProjectAndBranch(project, branch);
+    let notice: string | undefined;
+    if (info.fallbackUsed) {
+      notice = `⚠️ Branch '${info.requestedBranch}' is not indexed for project '${info.base}'. ` +
+        `Returned data is from branch '${info.resolvedBranch}'. ` +
+        `Indexed branches: ${info.availableBranches.join(', ') || '(none)'}.`;
+    } else if (!info.available && info.base) {
+      notice = `⚠️ No indexed data found for project '${info.base}' on branch '${info.requestedBranch}'. ` +
+        `Indexed branches: ${info.availableBranches.join(', ') || '(none)'}.`;
+    }
+    return { projectId: info.projectId, notice };
+  }
+
+  /** Wraps a payload (object or string) as MCP text content, prefixing a branch notice. */
+  private textResult(notice: string | undefined, payload: any) {
+    const body = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+    const text = notice ? `${notice}\n\n${body}` : body;
+    return { content: [{ type: 'text' as const, text }] };
+  }
+
   private createServer(): McpServer {
     const server = new McpServer({
       name: this.serverName,
@@ -85,17 +113,13 @@ export class HTTPHandler {
       'List all code entities of a specific type (e.g., all classes, all interfaces, all methods). Use when you want to browse or list entities by category rather than searching by name.',
       {
         nodeType: z.enum(['class', 'interface', 'enum', 'exception', 'method', 'function', 'field', 'package', 'module']).describe('Type of code entity (lowercase)'),
-        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ nodeType, projectId }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const nodes = await this.nodeManager.findNodesByType(nodeType as any, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(nodes, null, 2)
-          }]
-        };
+      async ({ nodeType, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const nodes = await this.nodeManager.findNodesByType(nodeType as any, resolvedProject!);
+        return this.textResult(notice, nodes);
       }
     );
 
@@ -105,17 +129,13 @@ export class HTTPHandler {
       'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. Examples: "find method validate", "search for interface Repository".',
       {
         searchTerm: z.string(),
-        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ searchTerm, projectId }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const nodes = await this.nodeManager.searchNodes(searchTerm, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(nodes, null, 2)
-          }]
-        };
+      async ({ searchTerm, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const nodes = await this.nodeManager.searchNodes(searchTerm, resolvedProject!);
+        return this.textResult(notice, nodes);
       }
     );
 
@@ -125,17 +145,13 @@ export class HTTPHandler {
       'Get detailed information about a specific code entity by its unique ID. Use this after search_nodes to get full details about a class, method, or other entity.',
       {
         nodeId: z.string(),
-        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ nodeId, projectId }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const node = await this.nodeManager.getNode(nodeId, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(node, null, 2)
-          }]
-        };
+      async ({ nodeId, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const node = await this.nodeManager.getNode(nodeId, resolvedProject!);
+        return this.textResult(notice, node);
       }
     );
 
@@ -145,17 +161,13 @@ export class HTTPHandler {
       'Get the full ancestor chain for a class by traversing EXTENDS edges upward (child → parent → grandparent). Returns all superclasses up to the root.',
       {
         className: z.string(),
-        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ className, projectId }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const hierarchy = await this.edgeManager.findInheritanceHierarchy(className, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(hierarchy, null, 2)
-          }]
-        };
+      async ({ className, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const hierarchy = await this.edgeManager.findInheritanceHierarchy(className, resolvedProject!);
+        return this.textResult(notice, hierarchy);
       }
     );
 
@@ -165,17 +177,13 @@ export class HTTPHandler {
       'Find all classes that implement an interface OR extend an abstract class. Searches both IMPLEMENTS and EXTENDS edges, and uses the is_abstract flag to correctly handle abstract class hierarchies.',
       {
         interfaceName: z.string(),
-        projectId: z.string().describe('Project identifier (e.g., "icm-as")')
+        projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ interfaceName, projectId }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const implementations = await this.edgeManager.findClassesThatImplementInterface(interfaceName, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(implementations, null, 2)
-          }]
-        };
+      async ({ interfaceName, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const implementations = await this.edgeManager.findClassesThatImplementInterface(interfaceName, resolvedProject!);
+        return this.textResult(notice, implementations);
       }
     );
 
@@ -186,17 +194,13 @@ export class HTTPHandler {
       {
         methodName: z.string().describe('Method name to search for callers of'),
         projectId: z.string().describe('Project identifier (e.g., "icm-as")'),
-        className: z.string().optional().describe('Optional: Class that declares the method (for disambiguation)')
+        className: z.string().optional().describe('Optional: Class that declares the method (for disambiguation)'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ methodName, projectId, className }) => {
-        const resolvedProject = await this.client.resolveProjectId(projectId);
-        const callers = await this.edgeManager.findClassesThatCallMethod(methodName, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(callers, null, 2)
-          }]
-        };
+      async ({ methodName, projectId, className, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(projectId, branch);
+        const callers = await this.edgeManager.findClassesThatCallMethod(methodName, resolvedProject!);
+        return this.textResult(notice, callers);
       }
     );
 
@@ -224,19 +228,20 @@ export class HTTPHandler {
       'List all packages found in a project, derived from qualified class names. Call this first to discover valid package names before calling calculate_package_metrics.',
       {
         projectId: z.string().optional().describe('Project ID to scope the operation to (e.g., "icm-as")'),
-        depth: z.number().optional().describe('Package depth to group by (default: 3, e.g. com.example.module)')
+        depth: z.number().optional().describe('Package depth to group by (default: 3, e.g. com.example.module)'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ projectId, depth }) => {
-        const resolvedProject = projectId ? await this.client.resolveProjectId(projectId) : undefined;
+      async ({ projectId, depth, branch }) => {
+        const { projectId: resolvedProject, notice } = projectId
+          ? await this.resolveWithNotice(projectId, branch)
+          : { projectId: undefined, notice: undefined };
         const packages = await this.metricsManager.listPackages(resolvedProject, depth ?? 3);
-        return {
-          content: [{
-            type: 'text',
-            text: packages.length > 0
-              ? `Found ${packages.length} packages (depth=${depth ?? 3}):\n${packages.join('\n')}`
-              : 'No packages found. Ensure nodes have qualified_name properties.'
-          }]
-        };
+        return this.textResult(
+          notice,
+          packages.length > 0
+            ? `Found ${packages.length} packages (depth=${depth ?? 3}):\n${packages.join('\n')}`
+            : 'No packages found. Ensure nodes have qualified_name properties.'
+        );
       }
     );
 
@@ -448,17 +453,13 @@ export class HTTPHandler {
       'Find all outgoing relationships from a node. Edge types: calls (method→method), implements (class→interface), extends (class→class), contains (class→method/field), references (class→class), throws (method→exception), belongs_to (method→class).',
       {
         project: z.string().describe('Project identifier (e.g., "icm-as")'),
-        sourceId: z.string()
+        sourceId: z.string(),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ project, sourceId }) => {
-        const resolvedProject = await this.client.resolveProjectId(project);
-        const result = await this.edgeManager.findEdgesBySource(sourceId, resolvedProject);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }]
-        };
+      async ({ project, sourceId, branch }) => {
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(project, branch);
+        const result = await this.edgeManager.findEdgesBySource(sourceId, resolvedProject!);
+        return this.textResult(notice, result);
       }
     );
 
@@ -467,17 +468,15 @@ export class HTTPHandler {
       'get_project_summary',
       'Get overall project metrics summary and quality assessment.',
       {
-        project: z.string().optional().describe('Project identifier (e.g., "icm-as")')
+        project: z.string().optional().describe('Project identifier (e.g., "icm-as")'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ project }) => {
-        const resolvedProject = project ? await this.client.resolveProjectId(project) : undefined;
+      async ({ project, branch }) => {
+        const { notice } = project
+          ? await this.resolveWithNotice(project, branch)
+          : { notice: undefined };
         const result = await this.metricsManager.calculateProjectSummary();
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }]
-        };
+        return this.textResult(notice, result);
       }
     );
 
@@ -536,18 +535,14 @@ export class HTTPHandler {
         annotation_name: z.string(),
         framework: z.string().optional(),
         category: z.string().optional(),
-        node_type: z.enum(['class', 'interface', 'enum', 'exception', 'function', 'method', 'field', 'package', 'module']).optional()
+        node_type: z.enum(['class', 'interface', 'enum', 'exception', 'function', 'method', 'field', 'package', 'module']).optional(),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
       async (args) => {
-        const resolvedProject = await this.client.resolveProjectId(args.project);
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(args.project, args.branch);
         const { findNodesByAnnotation } = await import('./tools/find-nodes-by-annotation.js');
         const result = await findNodesByAnnotation(this.client, { ...args, project: resolvedProject });
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(result, null, 2)
-          }]
-        };
+        return this.textResult(notice, result);
       }
     );
 
@@ -677,6 +672,7 @@ export class HTTPHandler {
       {
         query: z.string().describe('Natural language description of what the code does, e.g. "checks if approval is needed for a business object"'),
         project_id: z.string().optional().describe('Project identifier from list_projects. Omit to search across all projects.'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.'),
         node_types: z.array(z.enum(['class', 'interface', 'enum', 'exception', 'method', 'function', 'field', 'package', 'module'])).optional().describe('Filter results to specific node types. Omit to search all types.'),
         limit: z.number().int().min(1).max(100).optional().describe('Maximum number of results to return. Default: 10.'),
         similarity_threshold: z.number().min(0).max(1).optional().describe('Minimum similarity score (0.0–1.0). Higher = stricter match. Default: ~0.7.'),
@@ -684,9 +680,13 @@ export class HTTPHandler {
         max_hops: z.number().int().min(1).max(5).optional().describe('Graph traversal depth when include_graph_context is true. Default: 2.')
       },
       async (args) => {
+        const { branch, ...rest } = args as any;
+        const { projectId: resolvedProject, notice } = rest.project_id
+          ? await this.resolveWithNotice(rest.project_id, branch)
+          : { projectId: undefined, notice: undefined };
         const { semanticSearch } = await import('./tools/semantic-search.js');
-        const result = await semanticSearch(this.semanticSearchManager, args);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        const result = await semanticSearch(this.semanticSearchManager, { ...rest, project_id: resolvedProject });
+        return this.textResult(notice, result);
       }
     );
 
@@ -697,12 +697,15 @@ export class HTTPHandler {
       {
         node_id: z.string().describe('The ID of the reference node to find similar code for. Use get_node or search_nodes to obtain this.'),
         project_id: z.string().describe('Project identifier from list_projects.'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.'),
         limit: z.number().int().min(1).max(100).optional().describe('Maximum number of similar nodes to return. Default: 5.')
       },
       async (args) => {
+        const { branch, ...rest } = args as any;
+        const { projectId: resolvedProject, notice } = await this.resolveWithNotice(rest.project_id, branch);
         const { getSimilarCode } = await import('./tools/semantic-search.js');
-        const result = await getSimilarCode(this.semanticSearchManager, args);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        const result = await getSimilarCode(this.semanticSearchManager, { ...rest, project_id: resolvedProject });
+        return this.textResult(notice, result);
       }
     );
 

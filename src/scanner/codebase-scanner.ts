@@ -684,6 +684,12 @@ export class CodebaseScanner {
     } else if (this.embeddingService.isEnabled()) {
       console.log(`🧠 Generating semantic embeddings for ${successfullyStoredEntities.length} entities...`);
       try {
+        // Ensure the Neo4j vector index exists before embeddings are written.
+        // Without this index, db.index.vector.queryNodes (used by semantic search
+        // and get_similar_code) fails at query time. The CREATE ... IF NOT EXISTS
+        // statement is idempotent, so calling it on every scan is safe and cheap.
+        await this.semanticSearchManager.initializeVectorIndexes();
+
         const embeddingResult = await this.generateEmbeddingsForEntities(successfullyStoredEntities);
         console.log(`✅ Generated embeddings for ${embeddingResult.successful} entities (${embeddingResult.failed} failed)`);
         
