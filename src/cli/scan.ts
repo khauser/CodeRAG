@@ -269,7 +269,11 @@ program
         if (options.clearAll || options.clearGraph) {
           console.warn(`ℹ️  --clear-graph/--clear-all are ignored with --reindex (the swap replaces the target project atomically).`);
         }
-        reindexTempId = `__coderag_reindex__${Date.now()}`;
+        // Carry the target branch on the temp id so the transient ProjectContext
+        // (visible via list_projects while the scan runs) already reports the
+        // correct branch instead of defaulting to "main". The default branch
+        // produces no suffix, keeping the temp id backward compatible.
+        reindexTempId = Neo4jClient.composeProjectId(`__coderag_reindex__${Date.now()}`, branchName);
         console.log(`🟦 Atomic reindex enabled.`);
         console.log(`   Building into temporary project: ${reindexTempId}`);
         console.log(`   Target after swap:               ${targetProjectId}`);
