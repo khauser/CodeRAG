@@ -10,20 +10,18 @@ export class NodeManager {
     const projectLabel = this.client.getProjectLabel(node.project_id, node.type);
     
     const query = `
-      CREATE (n:${nodeLabel}:${projectLabel}:CodeNode {
-        id: $id,
-        project_id: $project_id,
-        type: $type,
-        name: $name,
-        qualified_name: $qualified_name,
-        description: $description,
-        source_file: $source_file,
-        start_line: $start_line,
-        end_line: $end_line,
-        modifiers: $modifiers,
-        is_abstract: $is_abstract,
-        attributes_json: $attributes_json
-      })
+      MERGE (n:CodeNode { project_id: $project_id, id: $id })
+      SET n:${nodeLabel}:${projectLabel},
+          n.type = $type,
+          n.name = $name,
+          n.qualified_name = $qualified_name,
+          n.description = $description,
+          n.source_file = $source_file,
+          n.start_line = $start_line,
+          n.end_line = $end_line,
+          n.modifiers = $modifiers,
+          n.is_abstract = $is_abstract,
+          n.attributes_json = $attributes_json
       RETURN n
     `;
 
@@ -99,22 +97,28 @@ export class NodeManager {
           attributes_json: JSON.stringify(n.attributes || {})
         }));
 
+        // MERGE (not CREATE) on the constraint-backed key (:CodeNode {project_id, id}).
+        // This makes the batch idempotent: duplicate IDs across batches (e.g. shared
+        // packages/classes spanning multiple file batches) update the existing node
+        // instead of aborting the whole transaction with a ConstraintValidation error.
+        // Aborting previously triggered a fallback to 200 individual inserts, which is
+        // catastrophically slow over a high-latency/VPN connection to the remote DB.
+        // The MERGE key uses the unique constraint on :CodeNode(project_id, id) so it
+        // stays index-backed; the type/project labels are added afterwards via SET.
         const query = `
           UNWIND $rows AS row
-          CREATE (n:${nodeLabel}:${projectLabel}:CodeNode {
-            id: row.id,
-            project_id: row.project_id,
-            type: row.type,
-            name: row.name,
-            qualified_name: row.qualified_name,
-            description: row.description,
-            source_file: row.source_file,
-            start_line: row.start_line,
-            end_line: row.end_line,
-            modifiers: row.modifiers,
-            is_abstract: row.is_abstract,
-            attributes_json: row.attributes_json
-          })
+          MERGE (n:CodeNode { project_id: row.project_id, id: row.id })
+          SET n:${nodeLabel}:${projectLabel},
+              n.type = row.type,
+              n.name = row.name,
+              n.qualified_name = row.qualified_name,
+              n.description = row.description,
+              n.source_file = row.source_file,
+              n.start_line = row.start_line,
+              n.end_line = row.end_line,
+              n.modifiers = row.modifiers,
+              n.is_abstract = row.is_abstract,
+              n.attributes_json = row.attributes_json
           RETURN row.id AS id
         `;
 
@@ -126,7 +130,8 @@ export class NodeManager {
           totalStored += result.records.length;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          // If batch fails (e.g. constraint violation), fall back to individual inserts
+          // With MERGE, constraint violations no longer occur. This fallback now only
+          // guards against transient/other errors by retrying nodes individually.
           if (message.includes('already exists') || message.includes('ConstraintValidation')) {
             for (const node of batch) {
               try {

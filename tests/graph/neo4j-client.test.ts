@@ -270,20 +270,30 @@ describe('Neo4jClient', () => {
       await client.connect();
 
       const upd = (n: number) => ({ records: [{ get: () => ({ toNumber: () => n }) }] });
+      // Default: every batched loop terminates immediately (0 updated). Individual
+      // batches are exercised below via mockResolvedValueOnce for the first few calls.
+      mockSession.run.mockReset();
+      mockSession.run.mockResolvedValue(upd(0));
       mockSession.run
         .mockResolvedValueOnce({ records: [] })   // delete stale target context
-        .mockResolvedValueOnce(upd(5))            // CodeNode batch 1
-        .mockResolvedValueOnce(upd(0))            // CodeNode batch 2 (done)
-        .mockResolvedValueOnce(upd(3))            // CodeEdge batch 1
-        .mockResolvedValueOnce(upd(0))            // CodeEdge batch 2 (done)
-        .mockResolvedValueOnce({ records: [] });  // move ProjectContext
+        .mockResolvedValueOnce(upd(5))            // first per-type label-swap batch
+        .mockResolvedValueOnce(upd(0));           // ...done
 
       await client.renameProject('__coderag_reindex__123', 'owner-repo@develop');
 
       const calls = mockSession.run.mock.calls.map((c: any[]) => c[0] as string);
       expect(calls[0]).toMatch(/MATCH \(p:ProjectContext \{project_id: \$newId\}\) DELETE p/);
+
+      // Per-project labels must be swapped, not just the project_id property:
+      // the stale temp label is removed and the correct target label is added.
+      expect(calls.some((q: string) =>
+        q.includes('REMOVE n:`Project___coderag_reindex__123_Class`') &&
+        q.includes('SET n:`Project_owner_repo_develop_Class`'))).toBe(true);
+
+      // Safety-net property re-point for any untyped/legacy nodes still remains.
       expect(calls.some((q: string) => q.includes('MATCH (n:CodeNode {project_id: $oldId})'))).toBe(true);
-      expect(calls.some((q: string) => q.includes('MATCH (n:CodeEdge {project_id: $oldId})'))).toBe(true);
+      // Relationships are matched by pattern (they carry no label).
+      expect(calls.some((q: string) => q.includes('-[r {project_id: $oldId}]->'))).toBe(true);
 
       const moveQuery = calls[calls.length - 1];
       expect(moveQuery).toMatch(/SET p.project_id = \$newId/);
@@ -572,6 +582,27 @@ describe('Neo4jClient', () => {
       const result = await client.resolveProjectAndBranch('unknown', 'feature/x');
       expect(result.available).toBe(false);
       expect(result.resolvedBranch).toBe('feature_x');
+    });
+
+    test('self-heals a stale cache: re-fetches when the requested branch looks missing', async () => {
+      delete process.env.CODERAG_DEFAULT_BRANCH;
+      delete process.env.CODERAG_BRANCH_FALLBACKS; // -> develop, main
+
+      // Simulate a warm, non-expired cache primed BEFORE "develop" was indexed by
+      // another process. The first (cached) read lacks "develop"; a forced refresh
+      // returns the up-to-date list including it.
+      (client as any).knownProjectIds = ['icm-as'];
+      (client as any).knownProjectIdsAt = Date.now();
+      jest.spyOn(client, 'getKnownProjectIds').mockImplementation(
+        async (forceRefresh?: boolean) =>
+          forceRefresh ? ['icm-as', 'icm-as@develop'] : ['icm-as']
+      );
+
+      const result = await client.resolveProjectAndBranch('icm-as', 'develop');
+      expect(result.resolvedBranch).toBe('develop');
+      expect(result.projectId).toBe('icm-as@develop');
+      expect(result.fallbackUsed).toBe(false);
+      expect(result.available).toBe(true);
     });
   });
 });

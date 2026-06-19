@@ -11,6 +11,28 @@ export const DEFAULT_BRANCH = 'main';
 /** Separator between the base project id and the branch in a composed project_id. */
 export const BRANCH_SEPARATOR = '@';
 
+/**
+ * All node `type` values that receive a per-project label
+ * (`Project_<sanitizedProjectId>_<NodeType>`) at insert time.
+ * Must cover the full CodeNode.type union (see src/types.ts), because the
+ * per-project label is always derived from the raw node.type (capitalized) by
+ * getProjectLabel — independent of NodeManager.getNodeLabel. Keeping this in sync
+ * lets an atomic --reindex swap rebrand every per-project label, not just the
+ * project_id property.
+ */
+export const NODE_TYPES = [
+  'class',
+  'interface',
+  'enum',
+  'exception',
+  'function',
+  'method',
+  'field',
+  'package',
+  'module',
+  'annotation'
+] as const;
+
 /** Result of resolving a (project, branch) pair against the graph. */
 export interface ResolvedProject {
   /** Full project_id to query (base or base@branch). */
@@ -35,6 +57,14 @@ export class Neo4jClient {
   private projectIdCache: Map<string, string> = new Map();
   /** Cached list of all known project_ids (primed lazily / by warmup) to avoid repeated full scans. */
   private knownProjectIds: string[] | null = null;
+  /** Epoch-ms when {@link knownProjectIds} was last populated; used for TTL expiry. */
+  private knownProjectIdsAt = 0;
+  /**
+   * Max age of the {@link knownProjectIds} cache before it is transparently refreshed.
+   * Long-running servers (e.g. the MCP container) would otherwise never see branches/projects
+   * indexed by a SEPARATE process after startup, falsely reporting them as "not indexed".
+   */
+  private static readonly KNOWN_PROJECT_IDS_TTL_MS = 30_000;
 
   constructor(private config: Neo4jConfig, projectConfig?: ProjectConfig) {
     this.projectConfig = projectConfig || {
@@ -187,8 +217,36 @@ export class Neo4jClient {
       branch || inlineBranch || Neo4jClient.getDefaultBranch()
     );
 
+    // First attempt with the (possibly cached) project-id list.
+    const usedCache =
+      this.knownProjectIds !== null &&
+      Date.now() - this.knownProjectIdsAt < Neo4jClient.KNOWN_PROJECT_IDS_TTL_MS;
+    let result = await this.computeBranchResolution(inputBase, requestedBranch, false);
+
+    // Self-heal against a stale cache: a long-running server may have indexed a new
+    // branch/project in ANOTHER process after this cache was primed. If the requested
+    // branch looks missing AND we relied on a cached list, force a single refresh and
+    // recompute before reporting it as "not indexed". When the first attempt already
+    // hit the DB (cache cold/expired), a retry would be redundant, so we skip it.
+    if (usedCache && (!result.available || result.fallbackUsed)) {
+      result = await this.computeBranchResolution(inputBase, requestedBranch, true);
+    }
+
+    return result;
+  }
+
+  /**
+   * Computes branch resolution against the current (optionally force-refreshed) set of
+   * known project ids. Extracted from {@link resolveProjectAndBranch} so the resolver can
+   * retry with a fresh project-id list when a branch appears to be missing.
+   */
+  private async computeBranchResolution(
+    inputBase: string,
+    requestedBranch: string,
+    forceRefresh: boolean
+  ): Promise<ResolvedProject> {
     // Build a map of base project id -> indexed branches.
-    const allProjectIds = await this.getKnownProjectIds();
+    const allProjectIds = await this.getKnownProjectIds(forceRefresh);
     const baseToBranches = new Map<string, Set<string>>();
     for (const pid of allProjectIds) {
       const { base, branch: b } = Neo4jClient.parseProjectId(pid);
@@ -266,7 +324,11 @@ export class Neo4jClient {
     }
 
     const resolved = await this.resolveProjectAndBranch(userInput, branch);
-    this.projectIdCache.set(cacheKey, resolved.projectId);
+    // Only cache confident resolutions. Caching a fallback (requested branch missing)
+    // would pin the wrong project_id forever, even after that branch gets indexed later.
+    if (resolved.available && !resolved.fallbackUsed) {
+      this.projectIdCache.set(cacheKey, resolved.projectId);
+    }
     return resolved.projectId;
   }
 
@@ -278,8 +340,11 @@ export class Neo4jClient {
    * databases with a cold page cache could exceed the MCP request timeout.
    */
   async getKnownProjectIds(forceRefresh = false): Promise<string[]> {
-    if (this.knownProjectIds && !forceRefresh) {
-      return this.knownProjectIds;
+    const fresh =
+      this.knownProjectIds !== null &&
+      Date.now() - this.knownProjectIdsAt < Neo4jClient.KNOWN_PROJECT_IDS_TTL_MS;
+    if (fresh && !forceRefresh) {
+      return this.knownProjectIds!;
     }
 
     // Cheap path: read from the small ProjectContext node set.
@@ -301,6 +366,7 @@ export class Neo4jClient {
     }
 
     this.knownProjectIds = ids;
+    this.knownProjectIdsAt = Date.now();
     return ids;
   }
 
@@ -482,8 +548,49 @@ export class Neo4jClient {
       { newId }
     );
 
-    // Rebrand nodes: match by the :CodeNode label and move them to the new id.
+    // Rebrand nodes: move them to the new id AND swap their per-project label.
+    //
+    // Every node carries TWO labels (see NodeManager.addNode/addNodesBatch):
+    //   • the generic :CodeNode label, and
+    //   • a per-project label `Project_<sanitizedProjectId>_<NodeType>`.
+    // The previous implementation only updated the `project_id` PROPERTY and left
+    // the per-project LABEL untouched, so after an atomic --reindex swap the nodes
+    // kept a stale label like `Project___coderag_reindex__<ts>_develop_Class`.
+    // That leaked the throwaway reindex project id into the graph forever.
+    //
+    // Labels cannot be parameterized in Cypher, so we swap them per node type using
+    // the same label-building logic that created them. The label parts are derived
+    // from a sanitized project id (alphanumerics/underscores only), so they are safe
+    // to interpolate; we still backtick-quote them defensively.
+    const rebrandNodesForType = async (nodeType: string): Promise<void> => {
+      const oldLabel = this.getProjectLabel(oldId, nodeType);
+      const newLabel = this.getProjectLabel(newId, nodeType);
+      let updated = 0;
+      do {
+        const res = await this.runQuery(
+          `MATCH (n:\`${oldLabel}\`)
+           WHERE n.project_id = $oldId
+           WITH n LIMIT ${BATCH_SIZE}
+           REMOVE n:\`${oldLabel}\`
+           SET n:\`${newLabel}\`, n.project_id = $newId
+           RETURN count(n) as updated`,
+          { oldId, newId }
+        );
+        updated = res.records[0]?.get('updated')?.toNumber?.() || res.records[0]?.get('updated') || 0;
+        if (updated > 0) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      } while (updated > 0);
+    };
+
     const rebrandNodes = async (): Promise<void> => {
+      // Swap the per-project label for every known node type.
+      for (const nodeType of NODE_TYPES) {
+        await rebrandNodesForType(nodeType);
+      }
+
+      // Safety net: re-point any remaining nodes (e.g. untyped/legacy nodes that
+      // never got a per-project label) by project_id property alone.
       let updated = 0;
       do {
         const res = await this.runQuery(
