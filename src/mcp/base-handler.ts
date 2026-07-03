@@ -54,6 +54,9 @@ import {
 import { 
   createRemoteScannerTools, handleRemoteScannerTool
 } from './tools/remote-scanner-tools.js';
+import { ProjectSelectionRequiredError } from './project-selection.js';
+
+export { ProjectSelectionRequiredError } from './project-selection.js';
 
 export abstract class BaseHandler {
   protected server: Server;
@@ -72,16 +75,182 @@ export abstract class BaseHandler {
   protected lastBranchResolution?: ResolvedProject;
 
   /**
+   * The project the user picked for the current session via the `list_projects`
+   * entry-point elicitation. When set, project-scoped tools fall back to it whenever
+   * the caller did not provide an explicit `project` argument.
+   */
+  protected sessionProject?: string;
+
+  /**
    * Resolves a user-provided project identifier (and optional branch) to the actual
    * project_id in the database. E.g., "icm-as" + branch "develop" →
    * "intershop-com/Products-icm-as@develop". Stores the full resolution so the tool
    * dispatcher can surface a fallback notice.
+   *
+   * If no project is supplied, falls back to the session project selected through the
+   * `list_projects` elicitation (if any).
    */
   protected async resolveProject(userProject: string | undefined, branch?: string): Promise<string> {
-    if (!userProject) return '';
-    const resolved = await this.client.resolveProjectAndBranch(userProject, branch);
+    const usingSessionProject = !userProject && !!this.sessionProject;
+    const effectiveProject = userProject || this.sessionProject;
+
+    if (!effectiveProject) {
+      // No project supplied and none selected this session → force a selection so we
+      // never run a project-scoped query without a target.
+      const chosen = await this.promptOrRequireSelection(undefined);
+      this.sessionProject = chosen;
+      const resolved = await this.client.resolveProjectAndBranch(chosen, undefined);
+      this.lastBranchResolution = resolved;
+      return resolved.projectId;
+    }
+
+    let resolved = await this.client.resolveProjectAndBranch(effectiveProject, branch);
     this.lastBranchResolution = resolved;
+
+    // The user explicitly pinned a branch when they passed a `branch` arg or an
+    // "@branch" suffix — respect it and never interrupt with a selection prompt.
+    const explicitBranch = !!branch || effectiveProject.includes('@');
+
+    // When the caller relies on a previously selected session project, the choice was
+    // already made once for the whole session, so we don't re-prompt.
+    if (!usingSessionProject && !explicitBranch && this.isSelectionAmbiguous(resolved)) {
+      const chosen = await this.promptOrRequireSelection(resolved);
+      this.sessionProject = chosen;
+      resolved = await this.client.resolveProjectAndBranch(chosen, undefined);
+      this.lastBranchResolution = resolved;
+    }
+
     return resolved.projectId;
+  }
+
+  /**
+   * A project reference is "ambiguous" when the user did not pin an exact, indexed
+   * branch: the requested branch fell back to another one, is not indexed at all, or
+   * the base project has more than one indexed branch to choose from. In those cases we
+   * must not silently query a guessed branch.
+   */
+  protected isSelectionAmbiguous(resolved: ResolvedProject): boolean {
+    return resolved.fallbackUsed || !resolved.available || resolved.availableBranches.length > 1;
+  }
+
+  /**
+   * Returns a concrete `base@branch` project id the user has chosen, preferring
+   * interactive MCP elicitation. When the client cannot elicit (or the user declines),
+   * throws {@link ProjectSelectionRequiredError} so the dispatcher can ask the assistant
+   * to run `list_projects` and confirm the project/branch with the user.
+   */
+  protected async promptOrRequireSelection(resolved?: ResolvedProject): Promise<string> {
+    const listResult = await listProjects(this.client, {});
+    const options = this.buildBranchLevelOptions(listResult?.bases ?? []);
+
+    const chosen = await this.elicitProjectChoice(options, resolved);
+    if (chosen) return chosen;
+
+    throw new ProjectSelectionRequiredError(this.buildSelectionGuidance(resolved, options));
+  }
+
+  /**
+   * Expands the grouped project list into one selectable option per (base, branch)
+   * pair, so the user can pick a concrete branch (e.g. "icm-as@develop") rather than a
+   * branch-less base that would later fall back to a guessed branch.
+   */
+  protected buildBranchLevelOptions(
+    bases: Array<{ base_project_id: string; name?: string; branches: string[] }>
+  ): Array<{ value: string; label: string }> {
+    const options: Array<{ value: string; label: string }> = [];
+    for (const b of bases) {
+      const branches = b.branches?.length ? b.branches : ['main'];
+      for (const branch of branches) {
+        const value = Neo4jClient.composeProjectId(b.base_project_id, branch);
+        const baseLabel = b.name && b.name !== b.base_project_id
+          ? `${b.name} (${b.base_project_id})`
+          : b.base_project_id;
+        options.push({ value, label: `${baseLabel} — branch: ${branch}` });
+      }
+    }
+    // Cap so the elicitation form stays manageable for clients that render every option.
+    return options.slice(0, 50);
+  }
+
+  /**
+   * Asks the user (via MCP elicitation) to pick a project/branch from {@link options}.
+   * Returns the chosen `base@branch` id, or undefined when elicitation is unsupported,
+   * declined or cancelled.
+   */
+  protected async elicitProjectChoice(
+    options: Array<{ value: string; label: string }>,
+    resolved?: ResolvedProject
+  ): Promise<string | undefined> {
+    if (options.length === 0) return undefined;
+
+    // Only attempt elicitation when the connected client advertises the capability.
+    const clientCaps = this.server.getClientCapabilities?.();
+    if (!clientCaps?.elicitation) return undefined;
+
+    const enumValues = options.map(o => o.value);
+    const enumNames = options.map(o => o.label);
+    const hint = resolved?.base
+      ? ` Detected project "${resolved.base}" with branches: ${resolved.availableBranches.join(', ') || '(none)'}.`
+      : '';
+
+    try {
+      const response = await this.server.elicitInput({
+        message: 'Which project and branch should be used for this CodeRAG session?' + hint +
+          ' The selection becomes the session default, so you can omit the "project" argument afterwards.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            project: {
+              type: 'string',
+              title: 'Project / branch',
+              description: 'Pick the project (and branch) to work with for the rest of this session.',
+              enum: enumValues,
+              enumNames
+            }
+          },
+          required: ['project']
+        }
+      });
+
+      if (response.action === 'accept') {
+        const chosen = response.content?.project;
+        if (typeof chosen === 'string' && chosen.length > 0) return chosen;
+      }
+      return undefined;
+    } catch {
+      // Client does not actually support elicitation, or the request failed.
+      return undefined;
+    }
+  }
+
+  /**
+   * Builds the human-readable guidance returned when a project/branch must be chosen but
+   * interactive elicitation is unavailable. It instructs the assistant to run
+   * `list_projects` and confirm the project/branch with the user.
+   */
+  protected buildSelectionGuidance(
+    resolved: ResolvedProject | undefined,
+    options: Array<{ value: string; label: string }>
+  ): string {
+    const lines: string[] = [];
+    if (resolved?.base) {
+      lines.push(
+        `⚠️ Project "${resolved.base}" has multiple indexed branches ` +
+        `(${resolved.availableBranches.join(', ') || '(none)'}). No branch was selected, so the ` +
+        `query was NOT executed — returning data from a guessed branch would be misleading.`
+      );
+    } else {
+      lines.push('⚠️ No project has been selected for this session, so the query was NOT executed.');
+    }
+    lines.push('');
+    lines.push('Next step: call `list_projects`, ask the user which project/branch to use, then pass ' +
+      'it as the "project" argument (e.g. "icm-as@develop").');
+    if (options.length > 0) {
+      lines.push('');
+      lines.push('Available projects/branches:');
+      for (const o of options) lines.push(`  - ${o.value}  (${o.label})`);
+    }
+    return lines.join('\n');
   }
 
   constructor(
@@ -128,6 +297,11 @@ export abstract class BaseHandler {
         const result = await this.dispatchTool(request);
         return this.withBranchNotice(result);
       } catch (error) {
+        // A required-but-missing project/branch selection is not a failure: surface the
+        // guidance to the assistant as a normal tool result so it runs `list_projects`.
+        if (error instanceof ProjectSelectionRequiredError) {
+          return { content: [{ type: 'text', text: error.guidance }] };
+        }
         if (error instanceof McpError) {
           throw error;
         }
@@ -409,11 +583,12 @@ export abstract class BaseHandler {
       },
       {
         name: 'lookup_class',
-        description: 'PRIMARY TOOL for questions about a specific class by name. Use this when the user asks about a class like "tell me about class X", "what is class X", "explain class X", "Was kannst du mir über Klasse X sagen", "Was ist die Klasse X". This is the correct tool for class name lookups - NOT semantic_search.',
+        description: 'PRIMARY TOOL for questions about a specific class by name. Use this when the user asks about a class like "tell me about class X", "what is class X", "explain class X", "Was kannst du mir über Klasse X sagen", "Was ist die Klasse X". This is the correct tool for class name lookups - NOT semantic_search. ' +
+          'WORKFLOW: Unless a project was already selected this session, call list_projects FIRST and ask the user which project (and branch) to use — there can be several indexed branches per project. Pass the chosen project as "project" (e.g. "icm-as@develop") so the lookup is scoped to the right branch.',
         inputSchema: {
           type: 'object',
           properties: {
-            project: { type: 'string', description: 'Project name or identifier' },
+            project: { type: 'string', description: 'Project name or identifier, optionally with a branch suffix (e.g. "icm-as@develop"). Obtain it from list_projects and confirm with the user. Can be omitted once a session project was selected via list_projects.' },
             class_name: { type: 'string', description: 'The exact class name from the user query (e.g., "IsApprovalNeeded", "UserService", "PaymentProcessor")' }
           },
           required: ['project', 'class_name']
@@ -421,11 +596,12 @@ export abstract class BaseHandler {
       },
       {
         name: 'search_nodes',
-        description: 'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. For class lookups, prefer lookup_class. Examples: "find method validate", "search for interface Repository".',
+        description: 'Search for classes, methods, interfaces, or functions by name. Use when looking for a specific code entity by its name. For class lookups, prefer lookup_class. Examples: "find method validate", "search for interface Repository". ' +
+          'WORKFLOW: Unless a project was already selected this session, call list_projects FIRST and ask the user which project (and branch) to use — there can be several indexed branches per project. Pass the chosen project as "project" (e.g. "icm-as@develop") so the search is scoped to the right branch.',
         inputSchema: {
           type: 'object',
           properties: {
-            project: { type: 'string', description: 'Project name or identifier to scope the operation to' },
+            project: { type: 'string', description: 'Project name or identifier, optionally with a branch suffix (e.g. "icm-as@develop"). Obtain it from list_projects and confirm with the user. Can be omitted once a session project was selected via list_projects.' },
             search_term: { type: 'string', description: 'Name or part of the name of the class, method, interface, or code entity to search for' },
             limit: {
               type: 'number',
@@ -890,7 +1066,9 @@ export abstract class BaseHandler {
       },
       {
         name: 'list_projects',
-        description: 'List all projects in the CodeRAG graph database with optional statistics',
+        description: 'ENTRY POINT: List all projects in the CodeRAG graph database with optional statistics. ' +
+          'Call this first — it asks the user (via elicitation) which project to use for the session and ' +
+          'remembers the choice, so subsequent project-scoped tools can omit the "project" argument.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1232,8 +1410,10 @@ export abstract class BaseHandler {
   }
 
   protected async handleCalculateCKMetrics(args: any) {
+    const projectId = await this.resolveProject(args?.project, args?.branch);
     const params: CalculateCKMetricsParams = {
-      classId: args?.class_id ?? args?.classId
+      classId: args?.class_id ?? args?.classId,
+      projectId
     };
     return await calculateCKMetrics(this.metricsManager, params, this.detailLevel);
   }
@@ -1253,8 +1433,10 @@ export abstract class BaseHandler {
   }
 
   protected async handleCalculatePackageMetrics(args: any) {
+    const projectId = await this.resolveProject(args?.project, args?.branch);
     const params: CalculatePackageMetricsParams = {
-      packageName: args?.packageName ?? args?.package_name
+      packageName: args?.packageName ?? args?.package_name,
+      projectId
     };
     return await calculatePackageMetrics(this.metricsManager, params, this.detailLevel);
   }
@@ -1494,9 +1676,42 @@ What aspect of inheritance would you like to explore first?`;
 
   protected async handleListProjects(args: any) {
     const result = await listProjects(this.client, args);
+
+    // list_projects acts as the session entry point: ask the user which project to
+    // work with via MCP elicitation, then remember it for subsequent tool calls.
+    const selectionNotice = await this.elicitSessionProject(result);
+
+    const payload = JSON.stringify(result, null, 2);
+    const text = selectionNotice ? `${selectionNotice}\n\n${payload}` : payload;
     return {
-      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+      content: [{ type: 'text', text }]
     };
+  }
+
+  /**
+   * Uses MCP elicitation to let the user choose which project should be used for the
+   * rest of the session. The choice is stored in {@link sessionProject} and used as the
+   * default `project` for project-scoped tools. Returns a human-readable notice
+   * describing the outcome, or undefined when elicitation is unavailable/unsupported.
+   */
+  protected async elicitSessionProject(listResult: any): Promise<string | undefined> {
+    const bases: Array<{ base_project_id: string; name?: string; branches: string[] }> =
+      listResult?.bases ?? [];
+    if (bases.length === 0) return undefined;
+
+    // Offer branch-level options so the user picks a concrete project/branch
+    // (e.g. "icm-as@develop") instead of a branch-less base that would later fall back.
+    const options = this.buildBranchLevelOptions(bases);
+    const chosen = await this.elicitProjectChoice(options);
+
+    if (chosen) {
+      this.sessionProject = chosen;
+      return `✅ Session project set to '${chosen}'. ` +
+        `Project-scoped tools will use it by default when no 'project' argument is given.`;
+    }
+
+    return `ℹ️ No session project selected. Provide the 'project' argument explicitly ` +
+      `(e.g. "icm-as@develop") on each tool call.`;
   }
 
   protected async handleSemanticSearch(args: any) {

@@ -48,6 +48,7 @@ program
   .option('--use-cache', 'Enable repository caching for faster subsequent scans', false)
   .option('--clear-cache', 'Clear git repository cache before scanning', false)
   .option('--no-embeddings', 'Skip automatic embedding generation after scan')
+  .option('--no-external-symbols', 'Do not create stub nodes for external/cross-project symbols (e.g. Spring, Jackson). Keeps the graph focused on project code and reduces RAG noise.')
   .option('-v, --verbose', 'Show detailed progress information', false)
   .action(async (projectPath: string, options) => {
     // Tracks the temporary project_id created for an atomic --reindex so it can be
@@ -246,7 +247,10 @@ program
           forceRefresh: options.clearCache
         },
         // Embedding settings
-        skipEmbeddings: options.embeddings === false
+        skipEmbeddings: options.embeddings === false,
+        // External symbol handling (commander maps --no-external-symbols to
+        // options.externalSymbols === false)
+        includeExternalSymbols: options.externalSymbols !== false
       };
 
       console.log(`\n⚙️ Scan Configuration:`);
@@ -257,6 +261,7 @@ program
       console.log(`  Languages: ${languages.join(', ')}`);
       console.log(`  Include tests: ${options.includeTests ? 'yes' : 'no'}`);
       console.log(`  Exclude paths: ${excludePaths.join(', ')}`);
+      console.log(`  External symbols: ${scanConfig.includeExternalSymbols ? 'included (stub nodes)' : 'excluded'}`);
 
       // Clear graph if requested / set up atomic reindex.
       // The branch this scan targets (default branch => no project_id suffix).

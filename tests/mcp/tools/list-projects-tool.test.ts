@@ -70,26 +70,29 @@ describe('List Projects Tool', () => {
 
       mockClient.listProjects.mockResolvedValue(mockProjects);
       
-      // Mock stats query - returns all stats in one record
+      // getAllProjectStats runs two graph-wide queries (entities, then
+      // relationships); records are keyed by project_id. A single record shape
+      // exposing all keys works for both queries.
       const mockRunQuery = mockClient.runQuery as jest.Mock;
-      mockRunQuery.mockResolvedValue({
-        records: [{
-          get: (key: string) => {
-            switch (key) {
-              case 'entity_count':
-                return { toNumber: () => 10 };
-              case 'relationship_count':
-                return { toNumber: () => 15 };
-              case 'entity_types':
-                return ['class', 'method', null];
-              case 'relationship_types':
-                return ['calls', 'implements', null];
-              default:
-                return null;
-            }
+      const makeRecord = (projectId: string) => ({
+        get: (key: string) => {
+          switch (key) {
+            case 'project_id':
+              return projectId;
+            case 'entity_count':
+              return { toNumber: () => 10 };
+            case 'relationship_count':
+              return { toNumber: () => 15 };
+            case 'entity_types':
+              return ['class', 'method', null];
+            case 'relationship_types':
+              return ['calls', 'implements', null];
+            default:
+              return null;
           }
-        }]
+        }
       });
+      mockRunQuery.mockResolvedValue({ records: [makeRecord('project1')] });
 
       const result = await listProjects(mockClient, { include_stats: true });
 
@@ -175,31 +178,22 @@ describe('List Projects Tool', () => {
 
       mockClient.listProjects.mockResolvedValue(mockProjects);
       
-      // Mock stats - project1 has fewer entities than project2
+      // Both graph-wide queries return one record per project. project1 has
+      // fewer entities than project2.
       const mockRunQuery = mockClient.runQuery as jest.Mock;
-      mockRunQuery
-        .mockResolvedValueOnce({ 
-          records: [{ 
-            get: (key: string) => {
-              if (key === 'entity_count') return { toNumber: () => 5 };
-              if (key === 'relationship_count') return { toNumber: () => 10 };
-              if (key === 'entity_types') return ['class', 'method'];
-              if (key === 'relationship_types') return ['calls', 'contains'];
-              return null;
-            }
-          }] 
-        }) // project1 stats
-        .mockResolvedValueOnce({ 
-          records: [{ 
-            get: (key: string) => {
-              if (key === 'entity_count') return { toNumber: () => 20 };
-              if (key === 'relationship_count') return { toNumber: () => 30 };
-              if (key === 'entity_types') return ['class', 'method', 'interface'];
-              if (key === 'relationship_types') return ['calls', 'contains', 'implements'];
-              return null;
-            }
-          }] 
-        }); // project2 stats
+      const makeRecord = (projectId: string, entities: number, rels: number) => ({
+        get: (key: string) => {
+          if (key === 'project_id') return projectId;
+          if (key === 'entity_count') return { toNumber: () => entities };
+          if (key === 'relationship_count') return { toNumber: () => rels };
+          if (key === 'entity_types') return ['class', 'method'];
+          if (key === 'relationship_types') return ['calls', 'contains'];
+          return null;
+        }
+      });
+      mockRunQuery.mockResolvedValue({
+        records: [makeRecord('project1', 5, 10), makeRecord('project2', 20, 30)]
+      });
 
       const result = await listProjects(mockClient, { include_stats: true, sort_by: 'entity_count' });
 
@@ -278,18 +272,19 @@ describe('List Projects Tool', () => {
 
       mockClient.listProjects.mockResolvedValue(mockProjects);
       
-      // Mock detailed stats queries
+      // Both graph-wide stats queries return one record for project1.
       const mockRunQuery = mockClient.runQuery as jest.Mock;
-      mockRunQuery.mockResolvedValueOnce({ 
-        records: [{ 
+      mockRunQuery.mockResolvedValue({
+        records: [{
           get: (key: string) => {
+            if (key === 'project_id') return 'project1';
             if (key === 'entity_count') return { toNumber: () => 25 };
             if (key === 'relationship_count') return { toNumber: () => 40 };
             if (key === 'entity_types') return ['class', 'method', 'field'];
             if (key === 'relationship_types') return ['calls', 'implements', 'extends'];
             return null;
           }
-        }] 
+        }]
       });
 
       const result = await listProjects(mockClient, { include_stats: true });

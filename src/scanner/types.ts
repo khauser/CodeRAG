@@ -20,6 +20,12 @@ export interface ScanConfig {
   };
   // Embedding options
   skipEmbeddings?: boolean;
+  // When false, external/cross-project relationship targets (e.g. framework
+  // classes like Spring or Jackson that are NOT part of the scanned project)
+  // are NOT materialized as stub nodes and their edges are dropped. This keeps
+  // the graph focused on project code and reduces RAG noise.
+  // Defaults to true to preserve previous behavior.
+  includeExternalSymbols?: boolean;
 }
 
 export type Language = 'typescript' | 'javascript' | 'java' | 'python' | 'csharp';

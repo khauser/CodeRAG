@@ -88,7 +88,15 @@ describe('SemanticSearchManager', () => {
 
       expect(mockNeo4jClient.runQuery).toHaveBeenCalledWith(
         expect.stringContaining('CREATE VECTOR INDEX semantic_embeddings'),
-        expect.objectContaining({ dimensions: expect.any(Number) })
+        // `dimensions` is wrapped with neo4j.int(...) in production so Bolt sends an
+        // INTEGER (not a Float) for the vector index config. neo4j.int returns an
+        // Integer object exposing numeric { low, high } fields rather than a JS number.
+        expect.objectContaining({
+          dimensions: expect.objectContaining({
+            low: expect.any(Number),
+            high: expect.any(Number)
+          })
+        })
       );
       expect(consoleSpy).toHaveBeenCalledWith('Vector indexes initialized successfully');
 
@@ -376,14 +384,16 @@ describe('SemanticSearchManager', () => {
       mockEmbeddingService.extractSemanticContent.mockReturnValue('email validation');
       mockEmbeddingService.generateEmbeddings.mockResolvedValue([mockEmbedding]);
 
-      // Mock successful embedding storage
-      const addEmbeddingSpy = jest.spyOn(manager, 'addEmbeddingToNode').mockResolvedValue();
+      // Mock successful embedding storage (batch write)
+      const addEmbeddingSpy = jest.spyOn(manager, 'addEmbeddingsToNodes').mockResolvedValue(1);
 
       const result = await manager.updateEmbeddings('test-project', ['function']);
 
       expect(result.updated).toBe(1);
       expect(result.failed).toBe(0);
-      expect(addEmbeddingSpy).toHaveBeenCalledWith('test-node', 'test-project', mockEmbedding);
+      expect(addEmbeddingSpy).toHaveBeenCalledWith([
+        { nodeId: 'test-node', projectId: 'test-project', embedding: mockEmbedding }
+      ]);
 
       addEmbeddingSpy.mockRestore();
     });
@@ -416,8 +426,8 @@ describe('SemanticSearchManager', () => {
       mockEmbeddingService.extractSemanticContent.mockReturnValue('email validation');
       mockEmbeddingService.generateEmbeddings.mockResolvedValue([mockEmbedding]);
 
-      // Mock embedding storage failure
-      const addEmbeddingSpy = jest.spyOn(manager, 'addEmbeddingToNode')
+      // Mock embedding storage failure (batch write)
+      const addEmbeddingSpy = jest.spyOn(manager, 'addEmbeddingsToNodes')
         .mockRejectedValue(new Error('Storage failed'));
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
 

@@ -241,7 +241,8 @@ export class SSEHandler extends BaseHandler {
     // New metrics endpoints
     this.app.get('/api/metrics/ck/:classId', async (req, res) => {
       try {
-        const metrics = await this.metricsManager.calculateCKMetrics(req.params.classId);
+        const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+        const metrics = await this.metricsManager.calculateCKMetrics(req.params.classId, projectId);
         res.json(metrics);
       } catch (error) {
         res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -250,7 +251,8 @@ export class SSEHandler extends BaseHandler {
 
     this.app.get('/api/metrics/package/:packageName', async (req, res) => {
       try {
-        const metrics = await this.metricsManager.calculatePackageMetrics(req.params.packageName);
+        const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+        const metrics = await this.metricsManager.calculatePackageMetrics(req.params.packageName, projectId);
         res.json(metrics);
       } catch (error) {
         res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -259,7 +261,8 @@ export class SSEHandler extends BaseHandler {
 
     this.app.get('/api/metrics/issues', async (req, res) => {
       try {
-        const issues = await this.metricsManager.findArchitecturalIssues();
+        const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+        const issues = await this.metricsManager.findArchitecturalIssues(projectId);
         res.json(issues);
       } catch (error) {
         res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -268,7 +271,8 @@ export class SSEHandler extends BaseHandler {
 
     this.app.get('/api/metrics/summary', async (req, res) => {
       try {
-        const summary = await this.metricsManager.calculateProjectSummary();
+        const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+        const summary = await this.metricsManager.calculateProjectSummary(projectId);
         res.json(summary);
       } catch (error) {
         res.status(500).json({ error: error instanceof Error ? error.message : String(error) });

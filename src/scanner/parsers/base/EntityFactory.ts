@@ -48,6 +48,9 @@ export class EntityFactory {
       start_line: startLine,
       end_line: endLine,
       modifiers: modifiers || [],
+      // Java/TypeScript interfaces are implicitly abstract by definition.
+      // Setting this explicitly keeps the abstractness metric accurate.
+      is_abstract: true,
       description,
       annotations: annotations || []
     };
@@ -148,6 +151,8 @@ export class EntityFactory {
       start_line: startLine,
       end_line: endLine,
       modifiers: modifiers || [],
+      // Enums are concrete types, never abstract.
+      is_abstract: false,
       description,
       annotations: annotations || []
     };

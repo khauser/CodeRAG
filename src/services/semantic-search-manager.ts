@@ -36,7 +36,10 @@ export class SemanticSearchManager {
       `;
 
       await this.neo4jClient.runQuery(indexQuery, { 
-        dimensions: this.config.dimensions 
+        // Bolt encodes plain JS numbers as Neo4j Floats (e.g. 3072.0), but the vector
+        // index config requires an INTEGER for `vector.dimensions`. Wrap with neo4j.int
+        // so it is sent as an integer and the CREATE VECTOR INDEX call is accepted.
+        dimensions: neo4j.int(this.config.dimensions) 
       });
 
       console.log('Vector indexes initialized successfully');
@@ -68,6 +71,46 @@ export class SemanticSearchManager {
     if (result.records.length === 0) {
       throw new Error(`Node not found: ${nodeId} in project ${projectId}`);
     }
+  }
+
+  /**
+   * Persists embeddings for many nodes in a SINGLE Neo4j round-trip via UNWIND.
+   * Drastically reduces network round-trips compared to writing nodes one by one.
+   *
+   * @param items embeddings to persist, each tied to a node id and project id
+   * @returns the number of nodes successfully updated
+   */
+  async addEmbeddingsToNodes(
+    items: Array<{ nodeId: string; projectId: string; embedding: SemanticEmbedding }>
+  ): Promise<number> {
+    if (items.length === 0) {
+      return 0;
+    }
+
+    const rows = items.map(it => ({
+      nodeId: it.nodeId,
+      projectId: it.projectId,
+      vector: it.embedding.vector,
+      model: it.embedding.model,
+      version: it.embedding.version,
+      createdAt: it.embedding.created_at.toISOString()
+    }));
+
+    const query = `
+      UNWIND $rows AS row
+      MATCH (n:CodeNode {id: row.nodeId, project_id: row.projectId})
+      SET n.semantic_embedding = row.vector,
+          n.embedding_model = row.model,
+          n.embedding_version = row.version,
+          n.embedding_created_at = row.createdAt
+      RETURN count(n) AS updated
+    `;
+
+    const result = await this.neo4jClient.runQuery(query, { rows });
+    const updated = result.records[0]?.get('updated');
+    return typeof updated === 'object' && updated !== null && 'toNumber' in updated
+      ? (updated as any).toNumber()
+      : Number(updated || 0);
   }
 
   async semanticSearch(params: SemanticSearchParams): Promise<SemanticSearchResult[]> {
@@ -258,63 +301,100 @@ export class SemanticSearchManager {
       queryParams.nodeTypes = nodeTypes;
     }
 
-    // Get nodes that need embedding updates
-    const query = `
-      MATCH (n:CodeNode)
-      WHERE ${whereClause}
-      RETURN n
-      ORDER BY n.id
-    `;
+    // Count the matching nodes up front (cheap) so we can show progress/ETA without
+    // having to load every node into memory at once.
+    const countResult = await this.neo4jClient.runQuery(
+      `MATCH (n:CodeNode) WHERE ${whereClause} RETURN count(n) AS total`,
+      queryParams
+    );
+    const totalRaw = countResult.records[0]?.get('total');
+    const totalNodes = typeof totalRaw === 'object' && totalRaw !== null && 'toNumber' in totalRaw
+      ? (totalRaw as any).toNumber()
+      : Number(totalRaw || 0);
 
-    const result = await this.neo4jClient.runQuery(query, queryParams);
-    const nodes = result.records.map(record => this.neo4jRecordToCodeNode(record.get('n')));
-
-    console.log(`🧠 Generating embeddings for ${nodes.length} entities...`);
+    console.log(`🧠 Generating embeddings for ${totalNodes} entities...`);
 
     let updated = 0;
     let failed = 0;
 
-    // Process nodes in batches
+    // Process nodes in batches. Rather than loading every matching node into memory
+    // (which can OOM on large projects with hundreds of thousands of entities), we
+    // stream them page-by-page using keyset pagination on n.id. Only one batch is
+    // ever resident in memory at a time.
     const batchSize = this.config.batch_size;
-    const totalBatches = Math.ceil(nodes.length / batchSize);
+    const totalBatches = Math.max(1, Math.ceil(totalNodes / batchSize));
     const startTime = Date.now();
     let processedBatches = 0;
+    let lastId: string | null = null;
 
-    for (let i = 0; i < nodes.length; i += batchSize) {
-      const batch = nodes.slice(i, i + batchSize);
-      
+    const pageQuery = `
+      MATCH (n:CodeNode)
+      WHERE ${whereClause}${' AND n.id > $lastId'}
+      RETURN n
+      ORDER BY n.id
+      LIMIT $pageSize
+    `;
+    const pageSize = neo4j.int(batchSize);
+
+    while (true) {
+      // Keyset pagination: fetch the next page of nodes after the last id we saw.
+      const pageParams: Record<string, any> = {
+        ...queryParams,
+        pageSize,
+        lastId: lastId ?? ''
+      };
+      const pageResult = await this.neo4jClient.runQuery(pageQuery, pageParams);
+      if (pageResult.records.length === 0) {
+        break;
+      }
+
+      const batch = pageResult.records.map(record => this.neo4jRecordToCodeNode(record.get('n')));
+      lastId = batch[batch.length - 1].id;
+
       try {
-        // Fetch context for class/interface/enum nodes, then extract semantic content
-        const texts = await Promise.all(batch.map(async (node) => {
+        // Fetch context for all class/interface/enum nodes in the batch with a SINGLE
+        // round-trip to Neo4j (instead of 4 sequential queries per node). This avoids
+        // hundreds of thousands of network round-trips to a remote database.
+        const enrichNodes = batch.filter(
+          n => n.type === 'class' || n.type === 'interface' || n.type === 'enum'
+        );
+        const contextMap = await this.fetchNodeContextsBatch(enrichNodes);
+
+        const texts = batch.map((node) => {
           if (node.type === 'class' || node.type === 'interface' || node.type === 'enum') {
-            const context = await this.fetchNodeContext(node);
+            const context = contextMap.get(node.id) || {};
             return this.embeddingService.extractSemanticContent(node, context);
           }
           return this.embeddingService.extractSemanticContent(node);
-        }));
+        });
         
         // Generate embeddings
         const embeddings = await this.embeddingService.generateEmbeddings(texts);
-        
-        // Update nodes with embeddings
+
+        // Collect successfully generated embeddings, then persist them in a
+        // SINGLE round-trip instead of one write per node.
+        const toWrite: Array<{ nodeId: string; projectId: string; embedding: SemanticEmbedding }> = [];
         for (let j = 0; j < batch.length; j++) {
           const node = batch[j];
           const embedding = embeddings[j];
-          
           if (embedding) {
-            try {
-              await this.addEmbeddingToNode(node.id, node.project_id, embedding);
-              updated++;
-            } catch (error) {
-              console.error(`Failed to update embedding for node ${node.id}:`, error);
-              failed++;
-            }
+            toWrite.push({ nodeId: node.id, projectId: node.project_id, embedding });
           } else {
             failed++;
           }
         }
+
+        try {
+          const written = await this.addEmbeddingsToNodes(toWrite);
+          updated += written;
+          // Any rows that matched no node count as failures
+          failed += toWrite.length - written;
+        } catch (error) {
+          console.error(`Failed to persist embeddings for batch ending at id ${lastId}:`, error);
+          failed += toWrite.length;
+        }
       } catch (error) {
-        console.error(`Failed to process batch starting at index ${i}:`, error);
+        console.error(`Failed to process batch ending at id ${lastId}:`, error);
         failed += batch.length;
       }
 
@@ -324,12 +404,17 @@ export class SemanticSearchManager {
       if (processedBatches % 10 === 0 || processedBatches === totalBatches) {
         const elapsedMs = Date.now() - startTime;
         const avgMsPerBatch = elapsedMs / processedBatches;
-        const remainingBatches = totalBatches - processedBatches;
+        const remainingBatches = Math.max(0, totalBatches - processedBatches);
         const etaMs = avgMsPerBatch * remainingBatches;
         const etaStr = this.formatDuration(etaMs);
-        const percent = Math.round((processedBatches / totalBatches) * 100);
+        const percent = Math.min(100, Math.round((processedBatches / totalBatches) * 100));
         
-        console.log(`⏳ Progress: ${percent}% (${updated + failed}/${nodes.length}) | ETA: ${etaStr}`);
+        console.log(`⏳ Progress: ${percent}% (${updated + failed}/${totalNodes}) | ETA: ${etaStr}`);
+      }
+
+      // The final page is shorter than a full batch, so stop once we've drained it.
+      if (batch.length < batchSize) {
+        break;
       }
     }
 
@@ -338,113 +423,116 @@ export class SemanticSearchManager {
   }
 
   /**
-   * Fetches enrichment context for a class/interface/enum node from the graph.
-   * Queries EXTENDS, IMPLEMENTS, and CONTAINS edges plus child node metadata
-   * to build a {@link NodeContext} used for class-level summary embeddings.
+   * Fetches enrichment context for a batch of class/interface/enum nodes in a SINGLE
+   * Neo4j round-trip, using pattern comprehensions to gather EXTENDS, IMPLEMENTS and
+   * CONTAINS (method/field) data per node. This replaces the previous approach of
+   * issuing 4 sequential queries per node, which caused hundreds of thousands of
+   * round-trips against a remote database.
    *
-   * @param node the class/interface/enum code node
-   * @returns enrichment context gathered from graph relationships
+   * @param nodes the class/interface/enum code nodes to enrich
+   * @returns a map of node id to its {@link NodeContext}
    */
-  private async fetchNodeContext(node: CodeNode): Promise<NodeContext> {
-    const context: NodeContext = {};
+  private async fetchNodeContextsBatch(nodes: CodeNode[]): Promise<Map<string, NodeContext>> {
+    const contextMap = new Map<string, NodeContext>();
+    if (nodes.length === 0) {
+      return contextMap;
+    }
 
-    try {
-      // Fetch superclass (EXTENDS edge)
-      const extendsResult = await this.neo4jClient.runQuery(
-        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:EXTENDS]->(parent:CodeNode)
-         RETURN parent.name AS name LIMIT 1`,
-        { id: node.id, projectId: node.project_id }
-      );
-      if (extendsResult.records.length > 0) {
-        context.superclass = extendsResult.records[0].get('name');
-      }
-
-      // Fetch implemented interfaces (IMPLEMENTS edges)
-      const implResult = await this.neo4jClient.runQuery(
-        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:IMPLEMENTS]->(iface:CodeNode)
-         RETURN iface.name AS name`,
-        { id: node.id, projectId: node.project_id }
-      );
-      if (implResult.records.length > 0) {
-        context.implemented_interfaces = implResult.records.map(r => r.get('name'));
-      }
-
-      // Fetch child methods (CONTAINS edges to method children)
-      const methodsResult = await this.neo4jClient.runQuery(
-        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:CONTAINS]->(m:CodeNode)
-         WHERE m.type = 'method'
-         RETURN m.name AS name, m.modifiers AS modifiers`,
-        { id: node.id, projectId: node.project_id }
-      );
-      if (methodsResult.records.length > 0) {
-        const publicMethods: string[] = [];
-        const privateMethods: string[] = [];
-        for (const r of methodsResult.records) {
-          const name = r.get('name');
-          const modifiers: string[] = r.get('modifiers') || [];
-          if (modifiers.includes('public')) {
-            publicMethods.push(name);
-          } else if (modifiers.includes('private')) {
-            privateMethods.push(name);
-          }
-        }
-        if (publicMethods.length > 0) {
-          context.public_methods = publicMethods;
-        }
-        if (privateMethods.length > 0) {
-          context.important_private_methods = privateMethods;
-        }
-      }
-
-      // Fetch injected dependencies (fields with @Inject annotation)
-      const depsResult = await this.neo4jClient.runQuery(
-        `MATCH (n:CodeNode {id: $id, project_id: $projectId})-[:CONTAINS]->(f:CodeNode)
-         WHERE f.type = 'field'
-         RETURN f.name AS name, f.attributes AS attributes`,
-        { id: node.id, projectId: node.project_id }
-      );
-      if (depsResult.records.length > 0) {
-        const injected: string[] = [];
-        const repos: string[] = [];
-        for (const r of depsResult.records) {
-          const attrs = r.get('attributes');
-          const parsed = attrs ? (typeof attrs === 'string' ? JSON.parse(attrs) : attrs) : {};
-          const annotations: Array<{ name: string }> = parsed?.annotations || [];
-          const isInjected = annotations.some(a =>
-            a.name === '@Inject' || a.name === '@Autowired'
-          );
-          if (isInjected) {
-            const fieldName = r.get('name');
-            injected.push(fieldName);
-            if (fieldName.toLowerCase().includes('repository')) {
-              repos.push(fieldName);
-            }
-          }
-        }
-        if (injected.length > 0) {
-          context.injected_dependencies = injected;
-        }
-        if (repos.length > 0) {
-          context.repositories_used = repos;
-        }
-      }
-
-      // Derive module from source_file path
+    // Always derive the cheap, DB-free parts (module + architectural role) locally.
+    for (const node of nodes) {
+      const context: NodeContext = {};
       if (node.source_file) {
         const moduleMatch = node.source_file.match(/(?:^|[/\\])((?:bc|ac|app|pf|ft|sld|init|orm)_[^/\\]+)/);
         if (moduleMatch) {
           context.module = moduleMatch[1];
         }
       }
-
-      // Derive architectural role from naming conventions and annotations
       context.architectural_role = this.inferArchitecturalRole(node);
-
-    } catch (error) {
-      console.warn(`Failed to fetch context for node ${node.id}:`, error instanceof Error ? error.message : 'Unknown error');
+      contextMap.set(node.id, context);
     }
 
-    return context;
+    try {
+      const items = nodes.map(n => ({ id: n.id, projectId: n.project_id }));
+      const result = await this.neo4jClient.runQuery(
+        `UNWIND $items AS item
+         MATCH (n:CodeNode {id: item.id, project_id: item.projectId})
+         RETURN n.id AS id,
+           [(n)-[:EXTENDS]->(p:CodeNode) | p.name][0] AS superclass,
+           [(n)-[:IMPLEMENTS]->(i:CodeNode) | i.name] AS interfaces,
+           [(n)-[:CONTAINS]->(m:CodeNode) WHERE m.type = 'method' | {name: m.name, modifiers: m.modifiers}] AS methods,
+           [(n)-[:CONTAINS]->(f:CodeNode) WHERE f.type = 'field' | {name: f.name, attributes: f.attributes}] AS fields`,
+        { items }
+      );
+
+      for (const record of result.records) {
+        const id = record.get('id');
+        const context = contextMap.get(id) || {};
+
+        // Superclass (EXTENDS)
+        const superclass = record.get('superclass');
+        if (superclass) {
+          context.superclass = superclass;
+        }
+
+        // Implemented interfaces (IMPLEMENTS)
+        const interfaces: string[] = (record.get('interfaces') || []).filter(Boolean);
+        if (interfaces.length > 0) {
+          context.implemented_interfaces = interfaces;
+        }
+
+        // Child methods (CONTAINS -> method)
+        const methods: Array<{ name: string; modifiers: string[] }> = record.get('methods') || [];
+        if (methods.length > 0) {
+          const publicMethods: string[] = [];
+          const privateMethods: string[] = [];
+          for (const m of methods) {
+            const modifiers: string[] = m.modifiers || [];
+            if (modifiers.includes('public')) {
+              publicMethods.push(m.name);
+            } else if (modifiers.includes('private')) {
+              privateMethods.push(m.name);
+            }
+          }
+          if (publicMethods.length > 0) {
+            context.public_methods = publicMethods;
+          }
+          if (privateMethods.length > 0) {
+            context.important_private_methods = privateMethods;
+          }
+        }
+
+        // Injected dependencies (CONTAINS -> field with @Inject/@Autowired)
+        const fields: Array<{ name: string; attributes: any }> = record.get('fields') || [];
+        if (fields.length > 0) {
+          const injected: string[] = [];
+          const repos: string[] = [];
+          for (const f of fields) {
+            const attrs = f.attributes;
+            const parsed = attrs ? (typeof attrs === 'string' ? JSON.parse(attrs) : attrs) : {};
+            const annotations: Array<{ name: string }> = parsed?.annotations || [];
+            const isInjected = annotations.some(a => a.name === '@Inject' || a.name === '@Autowired');
+            if (isInjected) {
+              injected.push(f.name);
+              if (f.name.toLowerCase().includes('repository')) {
+                repos.push(f.name);
+              }
+            }
+          }
+          if (injected.length > 0) {
+            context.injected_dependencies = injected;
+          }
+          if (repos.length > 0) {
+            context.repositories_used = repos;
+          }
+        }
+
+        contextMap.set(id, context);
+      }
+    } catch (error) {
+      console.warn(`Failed to fetch batch context:`, error instanceof Error ? error.message : 'Unknown error');
+    }
+
+    return contextMap;
   }
 
   /**

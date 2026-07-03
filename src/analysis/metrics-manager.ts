@@ -31,16 +31,16 @@ export interface ArchitecturalIssue {
 export class MetricsManager {
   constructor(private client: Neo4jClient) {}
 
-  async calculateCKMetrics(classId: string): Promise<CKMetrics> {
-    const className = await this.getClassName(classId);
+  async calculateCKMetrics(classId: string, projectId?: string): Promise<CKMetrics> {
+    const className = await this.getClassName(classId, projectId);
     
     const [wmc, dit, noc, cbo, rfc, lcom] = await Promise.all([
-      this.calculateWMC(classId),
-      this.calculateDIT(classId),
-      this.calculateNOC(classId),
-      this.calculateCBO(classId),
-      this.calculateRFC(classId),
-      this.calculateLCOM(classId)
+      this.calculateWMC(classId, projectId),
+      this.calculateDIT(classId, projectId),
+      this.calculateNOC(classId, projectId),
+      this.calculateCBO(classId, projectId),
+      this.calculateRFC(classId, projectId),
+      this.calculateLCOM(classId, projectId)
     ]);
 
     return {
@@ -55,11 +55,11 @@ export class MetricsManager {
     };
   }
 
-  async calculatePackageMetrics(packageName: string): Promise<PackageMetrics> {
+  async calculatePackageMetrics(packageName: string, projectId?: string): Promise<PackageMetrics> {
     const [ca, ce, abstractness] = await Promise.all([
-      this.calculateAfferentCoupling(packageName),
-      this.calculateEfferentCoupling(packageName),
-      this.calculateAbstractness(packageName)
+      this.calculateAfferentCoupling(packageName, projectId),
+      this.calculateEfferentCoupling(packageName, projectId),
+      this.calculateAbstractness(packageName, projectId)
     ]);
 
     const instability = (ca + ce) === 0 ? 0 : ce / (ca + ce);
@@ -75,25 +75,25 @@ export class MetricsManager {
     };
   }
 
-  async findArchitecturalIssues(): Promise<ArchitecturalIssue[]> {
+  async findArchitecturalIssues(projectId?: string): Promise<ArchitecturalIssue[]> {
     const issues: ArchitecturalIssue[] = [];
 
     // Find circular dependencies
-    const circularDeps = await this.findCircularDependencies();
+    const circularDeps = await this.findCircularDependencies(projectId);
     issues.push(...circularDeps);
 
     // Find god classes
-    const godClasses = await this.findGodClasses();
+    const godClasses = await this.findGodClasses(projectId);
     issues.push(...godClasses);
 
     // Find highly coupled classes
-    const highCoupling = await this.findHighlyCoupledClasses();
+    const highCoupling = await this.findHighlyCoupledClasses(projectId);
     issues.push(...highCoupling);
 
     return issues;
   }
 
-  async calculateProjectSummary(): Promise<{
+  async calculateProjectSummary(projectId?: string): Promise<{
     totalClasses: number;
     totalMethods: number;
     totalPackages: number;
@@ -111,11 +111,11 @@ export class MetricsManager {
       avgMetrics,
       issues
     ] = await Promise.all([
-      this.getTotalClasses(),
-      this.getTotalMethods(),
-      this.getTotalPackages(),
-      this.getAverageMetrics(),
-      this.findArchitecturalIssues()
+      this.getTotalClasses(projectId),
+      this.getTotalMethods(projectId),
+      this.getTotalPackages(projectId),
+      this.getAverageMetrics(projectId),
+      this.findArchitecturalIssues(projectId)
     ]);
 
     return {
@@ -128,38 +128,42 @@ export class MetricsManager {
   }
 
   // CK Metrics Implementation
-  private async calculateWMC(classId: string): Promise<number> {
+  private async calculateWMC(classId: string, projectId?: string): Promise<number> {
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH (class:CodeNode {id: $classId})-[:CONTAINS]->(method:CodeNode {type: 'method'})
+      MATCH (class:CodeNode ${anchor})-[:CONTAINS]->(method:CodeNode {type: 'method'})
       RETURN count(method) as wmc
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('wmc').toNumber() || 0;
   }
 
-  private async calculateDIT(classId: string): Promise<number> {
+  private async calculateDIT(classId: string, projectId?: string): Promise<number> {
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH path = (class:CodeNode {id: $classId})-[:EXTENDS*]->(ancestor:CodeNode)
+      MATCH path = (class:CodeNode ${anchor})-[:EXTENDS*]->(ancestor:CodeNode)
       RETURN max(length(path)) as dit
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('dit')?.toNumber() || 0;
   }
 
-  private async calculateNOC(classId: string): Promise<number> {
+  private async calculateNOC(classId: string, projectId?: string): Promise<number> {
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH (class:CodeNode {id: $classId})<-[:EXTENDS]-(child:CodeNode)
+      MATCH (class:CodeNode ${anchor})<-[:EXTENDS]-(child:CodeNode)
       RETURN count(child) as noc
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('noc').toNumber() || 0;
   }
 
-  private async calculateCBO(classId: string): Promise<number> {
+  private async calculateCBO(classId: string, projectId?: string): Promise<number> {
     // CBO counts the number of other classes this class is coupled to
     // This includes: inheritance, interface implementation, field types, method parameters, etc.
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH (class:CodeNode {id: $classId})
+      MATCH (class:CodeNode ${anchor})
       OPTIONAL MATCH (class)-[:EXTENDS|IMPLEMENTS|REFERENCES]->(other:CodeNode)
       WHERE other.type IN ['class', 'interface'] AND other.id <> $classId
       WITH class, collect(DISTINCT other) as outgoing
@@ -168,29 +172,31 @@ export class MetricsManager {
       WITH outgoing, collect(DISTINCT incoming) as incoming
       RETURN size(outgoing) + size(incoming) as cbo
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('cbo').toNumber() || 0;
   }
 
-  private async calculateRFC(classId: string): Promise<number> {
+  private async calculateRFC(classId: string, projectId?: string): Promise<number> {
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH (class:CodeNode {id: $classId})-[:CONTAINS]->(method:CodeNode {type: 'method'})
+      MATCH (class:CodeNode ${anchor})-[:CONTAINS]->(method:CodeNode {type: 'method'})
       OPTIONAL MATCH (method)-[:CALLS]->(calledMethod:CodeNode {type: 'method'})
       RETURN count(DISTINCT method) + count(DISTINCT calledMethod) as rfc
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('rfc').toNumber() || 0;
   }
 
-  private async calculateLCOM(classId: string): Promise<number> {
+  private async calculateLCOM(classId: string, projectId?: string): Promise<number> {
     // Simplified LCOM calculation - basic version
     // More sophisticated version would require field usage analysis
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
     const query = `
-      MATCH (class:CodeNode {id: $classId})-[:CONTAINS]->(method:CodeNode {type: 'method'})
+      MATCH (class:CodeNode ${anchor})-[:CONTAINS]->(method:CodeNode {type: 'method'})
       MATCH (class)-[:CONTAINS]->(field:CodeNode {type: 'field'})
       RETURN count(DISTINCT method) as methods, count(DISTINCT field) as fields
     `;
-    const result = await this.client.runQuery(query, { classId });
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     const record = result.records[0];
     const methods = record?.get('methods').toNumber() || 0;
     const fields = record?.get('fields').toNumber() || 0;
@@ -200,37 +206,63 @@ export class MetricsManager {
   }
 
   // Package Metrics Implementation
-  private async calculateAfferentCoupling(packageName: string): Promise<number> {
+  private async calculateAfferentCoupling(packageName: string, projectId?: string): Promise<number> {
+    const projectFilter = projectId
+      ? 'AND internal.project_id = $projectId AND external.project_id = $projectId'
+      : '';
     const query = `
-      MATCH (external:CodeNode)-[:CALLS|REFERENCES]->(internal:CodeNode)
+      MATCH (external:CodeNode)-[:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]->(internal:CodeNode)
       WHERE internal.qualified_name STARTS WITH $packagePrefix
       AND NOT external.qualified_name STARTS WITH $packagePrefix
+      ${projectFilter}
       RETURN count(DISTINCT external) as ca
     `;
-    const result = await this.client.runQuery(query, { packagePrefix: packageName + '.' });
+    const params: Record<string, any> = { packagePrefix: packageName + '.' };
+    if (projectId) params.projectId = projectId;
+    const result = await this.client.runQuery(query, params);
     return result.records[0]?.get('ca').toNumber() || 0;
   }
 
-  private async calculateEfferentCoupling(packageName: string): Promise<number> {
+  private async calculateEfferentCoupling(packageName: string, projectId?: string): Promise<number> {
+    const projectFilter = projectId
+      ? 'AND internal.project_id = $projectId AND external.project_id = $projectId'
+      : '';
     const query = `
-      MATCH (internal:CodeNode)-[:CALLS|REFERENCES]->(external:CodeNode)
+      MATCH (internal:CodeNode)-[:CALLS|REFERENCES|EXTENDS|IMPLEMENTS]->(external:CodeNode)
       WHERE internal.qualified_name STARTS WITH $packagePrefix
       AND NOT external.qualified_name STARTS WITH $packagePrefix
+      ${projectFilter}
       RETURN count(DISTINCT external) as ce
     `;
-    const result = await this.client.runQuery(query, { packagePrefix: packageName + '.' });
+    const params: Record<string, any> = { packagePrefix: packageName + '.' };
+    if (projectId) params.projectId = projectId;
+    const result = await this.client.runQuery(query, params);
     return result.records[0]?.get('ce').toNumber() || 0;
   }
 
-  private async calculateAbstractness(packageName: string): Promise<number> {
+  private async calculateAbstractness(packageName: string, projectId?: string): Promise<number> {
+    const projectFilter = projectId ? 'AND class.project_id = $projectId' : '';
+    // Martin's Abstractness A = (abstract classes + interfaces) / total types.
+    // The MATCH must include interfaces and enums, not just type='class' — otherwise
+    // packages composed mainly of interfaces report A=0 (the interface CASE branch
+    // could never fire under a type='class'-only filter). An interface is abstract by
+    // definition; a node is also abstract if it carries the 'abstract' modifier or
+    // has is_abstract=true. Enums are counted as concrete types in the denominator.
     const query = `
-      MATCH (class:CodeNode {type: 'class'})
+      MATCH (class:CodeNode)
       WHERE class.qualified_name STARTS WITH $packagePrefix
+      AND class.type IN ['class', 'interface', 'enum']
+      ${projectFilter}
       RETURN 
-        count(CASE WHEN 'abstract' IN class.modifiers OR class.type = 'interface' THEN 1 END) as abstractClasses,
+        count(CASE WHEN class.type = 'interface'
+                     OR class.is_abstract = true
+                     OR 'abstract' IN class.modifiers
+                   THEN 1 END) as abstractClasses,
         count(class) as totalClasses
     `;
-    const result = await this.client.runQuery(query, { packagePrefix: packageName + '.' });
+    const params: Record<string, any> = { packagePrefix: packageName + '.' };
+    if (projectId) params.projectId = projectId;
+    const result = await this.client.runQuery(query, params);
     const record = result.records[0];
     const abstract = record?.get('abstractClasses').toNumber() || 0;
     const total = record?.get('totalClasses').toNumber() || 0;
@@ -239,14 +271,15 @@ export class MetricsManager {
   }
 
   // Architectural Analysis
-  private async findCircularDependencies(): Promise<ArchitecturalIssue[]> {
+  private async findCircularDependencies(projectId?: string): Promise<ArchitecturalIssue[]> {
     // Detect circular dependencies between classes, excluding bidirectional ORM
     // parent-child relationships (e.g., ParentPO -> ChildPO -> ParentPO via owner reference).
     // Exclusion criteria for 2-hop cycles:
     //   1. Both classes end with "PO" and share the same package (ORM entity ownership), OR
     //   2. One class name contains the other (nested/attribute value pattern)
+    const anchor = projectId ? "{type: 'class', project_id: $projectId}" : "{type: 'class'}";
     const query = `
-      MATCH path = (c1:CodeNode {type: 'class'})-[:REFERENCES*2..5]->(c2:CodeNode {type: 'class'})
+      MATCH path = (c1:CodeNode ${anchor})-[:REFERENCES*2..5]->(c2:CodeNode {type: 'class'})
       WHERE c1 = c2
       WITH c1, nodes(path) as cycleNodes, length(path) as cycleLength
       // Check if all nodes in cycle are PO classes in the same package (ORM ownership pattern)
@@ -270,7 +303,7 @@ export class MetricsManager {
       WHERE NOT isBidirectionalOrm
       RETURN DISTINCT c1.name as className
     `;
-    const result = await this.client.runQuery(query);
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     
     return result.records.map(record => ({
       type: 'circular_dependency' as const,
@@ -280,9 +313,10 @@ export class MetricsManager {
     }));
   }
 
-  private async findGodClasses(): Promise<ArchitecturalIssue[]> {
+  private async findGodClasses(projectId?: string): Promise<ArchitecturalIssue[]> {
+    const anchor = projectId ? "{type: 'class', project_id: $projectId}" : "{type: 'class'}";
     const query = `
-      MATCH (class:CodeNode {type: 'class'})-[:CONTAINS]->(method:CodeNode {type: 'method'})
+      MATCH (class:CodeNode ${anchor})-[:CONTAINS]->(method:CodeNode {type: 'method'})
       WITH class, count(method) as methodCount
       WHERE methodCount > 20
       OPTIONAL MATCH (class)-[:CALLS|REFERENCES]-(other:CodeNode {type: 'class'})
@@ -290,7 +324,7 @@ export class MetricsManager {
       WHERE coupling > 10
       RETURN class.id as classId, class.name as className, methodCount, coupling
     `;
-    const result = await this.client.runQuery(query);
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     
     return result.records.map(record => ({
       type: 'god_class' as const,
@@ -304,15 +338,16 @@ export class MetricsManager {
     }));
   }
 
-  private async findHighlyCoupledClasses(): Promise<ArchitecturalIssue[]> {
+  private async findHighlyCoupledClasses(projectId?: string): Promise<ArchitecturalIssue[]> {
+    const anchor = projectId ? "{type: 'class', project_id: $projectId}" : "{type: 'class'}";
     const query = `
-      MATCH (class:CodeNode {type: 'class'})-[:CALLS|REFERENCES]-(other:CodeNode {type: 'class'})
+      MATCH (class:CodeNode ${anchor})-[:CALLS|REFERENCES]-(other:CodeNode {type: 'class'})
       WITH class, count(DISTINCT other) as coupling
       WHERE coupling > 15
       RETURN class.id as classId, class.name as className, coupling
       ORDER BY coupling DESC
     `;
-    const result = await this.client.runQuery(query);
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     
     return result.records.map(record => ({
       type: 'high_coupling' as const,
@@ -326,27 +361,37 @@ export class MetricsManager {
   }
 
   // Helper methods
-  private async getClassName(classId: string): Promise<string> {
-    const query = 'MATCH (class:CodeNode {id: $classId}) RETURN class.name as name';
-    const result = await this.client.runQuery(query, { classId });
+  private ckParams(classId: string, projectId?: string): Record<string, any> {
+    const params: Record<string, any> = { classId };
+    if (projectId) params.projectId = projectId;
+    return params;
+  }
+
+  private async getClassName(classId: string, projectId?: string): Promise<string> {
+    const anchor = projectId ? '{id: $classId, project_id: $projectId}' : '{id: $classId}';
+    const query = `MATCH (class:CodeNode ${anchor}) RETURN class.name as name`;
+    const result = await this.client.runQuery(query, this.ckParams(classId, projectId));
     return result.records[0]?.get('name') || 'Unknown';
   }
 
-  private async getTotalClasses(): Promise<number> {
-    const query = 'MATCH (class:CodeNode {type: "class"}) RETURN count(class) as total';
-    const result = await this.client.runQuery(query);
+  private async getTotalClasses(projectId?: string): Promise<number> {
+    const filter = projectId ? ' WHERE class.project_id = $projectId' : '';
+    const query = `MATCH (class:CodeNode {type: "class"})${filter} RETURN count(class) as total`;
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     return result.records[0]?.get('total').toNumber() || 0;
   }
 
-  private async getTotalMethods(): Promise<number> {
-    const query = 'MATCH (method:CodeNode {type: "method"}) RETURN count(method) as total';
-    const result = await this.client.runQuery(query);
+  private async getTotalMethods(projectId?: string): Promise<number> {
+    const filter = projectId ? ' WHERE method.project_id = $projectId' : '';
+    const query = `MATCH (method:CodeNode {type: "method"})${filter} RETURN count(method) as total`;
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     return result.records[0]?.get('total').toNumber() || 0;
   }
 
-  private async getTotalPackages(): Promise<number> {
-    const query = 'MATCH (pkg:CodeNode {type: "package"}) RETURN count(pkg) as total';
-    const result = await this.client.runQuery(query);
+  private async getTotalPackages(projectId?: string): Promise<number> {
+    const filter = projectId ? ' WHERE pkg.project_id = $projectId' : '';
+    const query = `MATCH (pkg:CodeNode {type: "package"})${filter} RETURN count(pkg) as total`;
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     return result.records[0]?.get('total').toNumber() || 0;
   }
 
@@ -369,9 +414,10 @@ export class MetricsManager {
     return result.records.map(r => r.get('package'));
   }
 
-  private async getAverageMetrics(): Promise<{ avgCBO: number; avgRFC: number; avgDIT: number }> {
+  private async getAverageMetrics(projectId?: string): Promise<{ avgCBO: number; avgRFC: number; avgDIT: number }> {
+    const anchor = projectId ? "{type: 'class', project_id: $projectId}" : "{type: 'class'}";
     const query = `
-      MATCH (class:CodeNode {type: 'class'})
+      MATCH (class:CodeNode ${anchor})
       OPTIONAL MATCH (class)-[:CALLS|REFERENCES]-(other:CodeNode {type: 'class'})
       WITH class, count(DISTINCT other) as cbo
       OPTIONAL MATCH (class)-[:CONTAINS]->(method:CodeNode {type: 'method'})
@@ -381,7 +427,7 @@ export class MetricsManager {
       WITH class, cbo, rfc, max(length(path)) as dit
       RETURN avg(cbo) as avgCBO, avg(rfc) as avgRFC, avg(dit) as avgDIT
     `;
-    const result = await this.client.runQuery(query);
+    const result = await this.client.runQuery(query, projectId ? { projectId } : {});
     const record = result.records[0];
     
     return {

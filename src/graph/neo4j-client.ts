@@ -85,7 +85,16 @@ export class Neo4jClient {
           // Fail fast instead of blocking forever when the DB is unreachable.
           connectionAcquisitionTimeout: 60_000, // ms
           connectionTimeout: 20_000, // ms
-          maxConnectionLifetime: 60 * 60 * 1000, // 1h
+          // Azure Container Apps' L4 ingress silently drops idle TCP connections
+          // after ~4 min. A 1h lifetime kept stale sockets in the pool, so the
+          // server logged "Response write failure" / "network aborts detected"
+          // when it tried to reply on a connection the load balancer had already
+          // torn down. Keep connections well under that idle window and probe any
+          // idle-for-a-while connection before reusing it.
+          maxConnectionLifetime: 3 * 60 * 1000, // 3 min (< ACA idle timeout)
+          // Ping pooled connections idle longer than this before handing them out,
+          // so dead/half-open sockets are detected & replaced instead of failing.
+          connectionLivenessCheckTimeout: 30_000, // ms
         }
       );
       
@@ -415,7 +424,23 @@ export class Neo4jClient {
       for (const constraint of constraints) {
         await session.run(constraint);
       }
-      
+
+      // Full-text index used by NodeManager.searchNodes for fast (sub-second) name /
+      // qualified_name / description lookups. The range indexes above do NOT accelerate
+      // substring (CONTAINS) matching, so on large projects (e.g. icm-as) the previous
+      // CONTAINS scan over every CodeNode — including large description fields —
+      // exceeded the MCP request timeout. A full-text index turns this into an indexed
+      // lookup. Created separately because the syntax differs from range indexes and a
+      // failure here must not abort the (already applied) core schema.
+      try {
+        await session.run(
+          `CREATE FULLTEXT INDEX codeNodeSearch IF NOT EXISTS
+           FOR (n:CodeNode) ON EACH [n.name, n.qualified_name, n.description]`
+        );
+      } catch (error) {
+        console.error('Full-text index creation failed (search will fall back to CONTAINS):', error);
+      }
+
       console.log('Database initialized with project-aware constraints and indexes');
     } finally {
       await session.close();

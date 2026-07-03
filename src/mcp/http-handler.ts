@@ -12,6 +12,8 @@ import { MetricsManager } from '../analysis/metrics-manager.js';
 import { SemanticSearchManager } from '../services/semantic-search-manager.js';
 import { EmbeddingService } from '../services/embedding-service.js';
 import { findArchitecturalIssues } from './tools/metrics-analysis.js';
+import { ProjectSelectionRequiredError } from './project-selection.js';
+import { listProjects } from './tools/list-projects.js';
 
 export class HTTPHandler {
   private app: express.Application;
@@ -23,6 +25,13 @@ export class HTTPHandler {
   private edgeManager: EdgeManager;
   private metricsManager: MetricsManager;
   private semanticSearchManager: SemanticSearchManager;
+
+  /**
+   * The project the user picked for this session (via list_projects elicitation or an
+   * inline selection prompt). When set, project-scoped tools fall back to it and skip
+   * re-prompting. Holds a concrete `base@branch` id, e.g. "icm-as@develop".
+   */
+  private sessionProject?: string;
 
 
   private setupMiddleware(): void {
@@ -75,13 +84,38 @@ export class HTTPHandler {
   /**
    * Resolves a (project, branch) pair to the stored project_id and builds a
    * transparency notice when a branch fallback was used or no data exists.
+   *
+   * Enforces an explicit project/branch choice: when the caller did not pin an exact
+   * indexed branch and has not selected a session project, this either elicits a choice
+   * (interactive clients) or throws {@link ProjectSelectionRequiredError} so the tool is
+   * NOT executed against a guessed branch.
    */
   private async resolveWithNotice(
     project: string | undefined,
     branch?: string
   ): Promise<{ projectId: string | undefined; notice?: string }> {
-    if (!project) return { projectId: undefined };
-    const info = await this.client.resolveProjectAndBranch(project, branch);
+    const usingSession = !project && !!this.sessionProject;
+    const effective = project || this.sessionProject;
+
+    if (!effective) {
+      // No project supplied and none selected this session → force a selection.
+      const chosen = await this.requireProjectSelection(undefined);
+      this.sessionProject = chosen;
+      const picked = await this.client.resolveProjectAndBranch(chosen, undefined);
+      return { projectId: picked.projectId };
+    }
+
+    let info = await this.client.resolveProjectAndBranch(effective, branch);
+
+    // The user explicitly pinned a branch (via `branch` arg or "@branch" suffix), or we
+    // are reusing the already-selected session project → never interrupt.
+    const explicitBranch = !!branch || effective.includes('@');
+    if (!usingSession && !explicitBranch && this.isSelectionAmbiguous(info)) {
+      const chosen = await this.requireProjectSelection(info);
+      this.sessionProject = chosen;
+      info = await this.client.resolveProjectAndBranch(chosen, undefined);
+    }
+
     let notice: string | undefined;
     if (info.fallbackUsed) {
       notice = `⚠️ Branch '${info.requestedBranch}' is not indexed for project '${info.base}'. ` +
@@ -94,11 +128,166 @@ export class HTTPHandler {
     return { projectId: info.projectId, notice };
   }
 
+  /**
+   * A project reference is "ambiguous" when the user did not pin an exact, indexed
+   * branch: the requested branch fell back to another one, is not indexed at all, or the
+   * base project has more than one indexed branch. In those cases we must not silently
+   * query a guessed branch.
+   */
+  private isSelectionAmbiguous(info: { fallbackUsed: boolean; available: boolean; availableBranches: string[] }): boolean {
+    return info.fallbackUsed || !info.available || info.availableBranches.length > 1;
+  }
+
+  /**
+   * Returns a concrete `base@branch` id the user has chosen, preferring interactive MCP
+   * elicitation. When the client cannot elicit (or the user declines), throws
+   * {@link ProjectSelectionRequiredError} so the assistant is told to run `list_projects`
+   * and confirm the project/branch with the user.
+   */
+  private async requireProjectSelection(
+    info?: { base: string; availableBranches: string[] }
+  ): Promise<string> {
+    const listResult = await listProjects(this.client, {});
+    const options = this.buildBranchLevelOptions((listResult as any)?.bases ?? []);
+
+    const chosen = await this.elicitProjectChoice(options, info);
+    if (chosen) return chosen;
+
+    throw new ProjectSelectionRequiredError(this.buildSelectionGuidance(info, options));
+  }
+
+  /**
+   * Expands the grouped project list into one selectable option per (base, branch) pair,
+   * so the user can pick a concrete branch (e.g. "icm-as@develop") rather than a
+   * branch-less base that would later fall back to a guessed branch.
+   */
+  private buildBranchLevelOptions(
+    bases: Array<{ base_project_id: string; name?: string; branches: string[] }>
+  ): Array<{ value: string; label: string }> {
+    const options: Array<{ value: string; label: string }> = [];
+    for (const b of bases) {
+      const branches = b.branches?.length ? b.branches : ['main'];
+      for (const branch of branches) {
+        const value = Neo4jClient.composeProjectId(b.base_project_id, branch);
+        const baseLabel = b.name && b.name !== b.base_project_id
+          ? `${b.name} (${b.base_project_id})`
+          : b.base_project_id;
+        options.push({ value, label: `${baseLabel} — branch: ${branch}` });
+      }
+    }
+    return options.slice(0, 50);
+  }
+
+  /**
+   * Asks the user (via MCP elicitation) to pick a project/branch from {@link options}.
+   * Returns the chosen `base@branch` id, or undefined when elicitation is unsupported,
+   * declined or cancelled.
+   */
+  private async elicitProjectChoice(
+    options: Array<{ value: string; label: string }>,
+    info?: { base: string; availableBranches: string[] }
+  ): Promise<string | undefined> {
+    if (options.length === 0) return undefined;
+
+    const underlying = this.server.server;
+    if (!underlying.getClientCapabilities?.()?.elicitation) return undefined;
+
+    const enumValues = options.map(o => o.value);
+    const enumNames = options.map(o => o.label);
+    const hint = info?.base
+      ? ` Detected project "${info.base}" with branches: ${info.availableBranches.join(', ') || '(none)'}.`
+      : '';
+
+    try {
+      const response = await underlying.elicitInput({
+        message: 'Which project and branch should be used for this CodeRAG session?' + hint +
+          ' The selection becomes the session default, so you can omit the "project" argument afterwards.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            project: {
+              type: 'string',
+              title: 'Project / branch',
+              description: 'Pick the project (and branch) to work with for the rest of this session.',
+              enum: enumValues,
+              enumNames
+            }
+          },
+          required: ['project']
+        }
+      });
+
+      if (response.action === 'accept') {
+        const chosen = response.content?.project;
+        if (typeof chosen === 'string' && chosen.length > 0) return chosen;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Builds the human-readable guidance returned when a project/branch must be chosen but
+   * interactive elicitation is unavailable. Instructs the assistant to run
+   * `list_projects` and confirm the project/branch with the user.
+   */
+  private buildSelectionGuidance(
+    info: { base: string; availableBranches: string[] } | undefined,
+    options: Array<{ value: string; label: string }>
+  ): string {
+    const lines: string[] = [];
+    if (info?.base) {
+      lines.push(
+        `⚠️ Project "${info.base}" has multiple indexed branches ` +
+        `(${info.availableBranches.join(', ') || '(none)'}). No branch was selected, so the ` +
+        `query was NOT executed — returning data from a guessed branch would be misleading.`
+      );
+    } else {
+      lines.push('⚠️ No project has been selected for this session, so the query was NOT executed.');
+    }
+    lines.push('');
+    lines.push('Next step: call `list_projects`, ask the user which project/branch to use, then pass ' +
+      'it as the "project"/"projectId" argument (e.g. "icm-as@develop").');
+    if (options.length > 0) {
+      lines.push('');
+      lines.push('Available projects/branches:');
+      for (const o of options) lines.push(`  - ${o.value}  (${o.label})`);
+    }
+    return lines.join('\n');
+  }
+
   /** Wraps a payload (object or string) as MCP text content, prefixing a branch notice. */
   private textResult(notice: string | undefined, payload: any) {
     const body = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
     const text = notice ? `${notice}\n\n${body}` : body;
     return { content: [{ type: 'text' as const, text }] };
+  }
+
+  /**
+   * Uses MCP elicitation to let the user pick which project to work with. Returns a
+   * human-readable notice with the chosen project, or undefined when the client does
+   * not support elicitation. The selection is surfaced in the tool result so the
+   * assistant can pass it to subsequent project-scoped tools.
+   */
+  private async elicitSessionProject(listResult: any): Promise<string | undefined> {
+    const bases: Array<{ base_project_id: string; name?: string; branches: string[] }> =
+      listResult?.bases ?? [];
+    if (bases.length === 0) return undefined;
+
+    // Offer branch-level options so the user picks a concrete project/branch
+    // (e.g. "icm-as@develop") instead of a branch-less base that would later fall back.
+    const options = this.buildBranchLevelOptions(bases);
+    const chosen = await this.elicitProjectChoice(options);
+
+    if (chosen) {
+      this.sessionProject = chosen;
+      return `✅ Session project set to '${chosen}'. ` +
+        `Project-scoped tools will use it by default when no 'project' argument is given.`;
+    }
+
+    return `ℹ️ No session project selected. Provide the 'project' argument explicitly ` +
+      `(e.g. "icm-as@develop") on each tool call.`;
   }
 
   private createServer(): McpServer {
@@ -209,16 +398,19 @@ export class HTTPHandler {
       'calculate_ck_metrics',
       'Calculate Chidamber & Kemerer object-oriented quality metrics for a class: WMC (complexity), DIT (inheritance depth), NOC (children), CBO (coupling), RFC (reachable methods), LCOM (cohesion). High CBO/WMC/RFC = risky to change.',
       {
-        classId: z.string()
+        classId: z.string(),
+        projectId: z.string().optional().describe('Project ID to scope the operation to (e.g., "icm-as"). Node IDs are not globally unique; without it metrics may aggregate across projects/branches.'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ classId }) => {
-        const metrics = await this.metricsManager.calculateCKMetrics(classId);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(metrics, null, 2)
-          }]
-        };
+      async ({ classId, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = projectId
+          ? await this.resolveWithNotice(projectId, branch)
+          : { projectId: undefined, notice: undefined };
+        const metrics = await this.metricsManager.calculateCKMetrics(classId, resolvedProject);
+        return this.textResult(
+          notice,
+          JSON.stringify(metrics, null, 2)
+        );
       }
     );
 
@@ -250,16 +442,19 @@ export class HTTPHandler {
       'calculate_package_metrics',
       'Calculate package coupling metrics (Ca, Ce, Instability, Abstractness, Distance from Main Sequence). Use list_packages first to discover valid packageName values.',
       {
-        packageName: z.string().describe('Fully qualified package name, e.g. com.example.module — use list_packages to find valid names')
+        packageName: z.string().describe('Fully qualified package name, e.g. com.example.module — use list_packages to find valid names'),
+        projectId: z.string().optional().describe('Project ID to scope the operation to (e.g., "icm-as"). Without it, metrics aggregate across ALL projects/branches.'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
-      async ({ packageName }) => {
-        const metrics = await this.metricsManager.calculatePackageMetrics(packageName);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(metrics, null, 2)
-          }]
-        };
+      async ({ packageName, projectId, branch }) => {
+        const { projectId: resolvedProject, notice } = projectId
+          ? await this.resolveWithNotice(projectId, branch)
+          : { projectId: undefined, notice: undefined };
+        const metrics = await this.metricsManager.calculatePackageMetrics(packageName, resolvedProject);
+        return this.textResult(
+          notice,
+          JSON.stringify(metrics, null, 2)
+        );
       }
     );
 
@@ -267,32 +462,46 @@ export class HTTPHandler {
     server.tool(
       'find_architectural_issues',
       'Detect architectural anti-patterns across the codebase: circular dependencies, god classes (too many methods or high coupling), and highly coupled classes. Returns paginated results — use limit/offset for large codebases.',
-      {},
-      async (args: any) => {
-        return await findArchitecturalIssues(this.metricsManager, args);
+      {
+        projectId: z.string().optional().describe('Project ID to scope the operation to (e.g., "icm-as"). Without it, issues are detected across ALL projects/branches.'),
+        branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.'),
+        limit: z.number().optional().describe('Maximum number of results to return'),
+        offset: z.number().optional().describe('Number of results to skip (for pagination)')
+      },
+      async ({ projectId, branch, limit, offset }) => {
+        const { projectId: resolvedProject, notice } = projectId
+          ? await this.resolveWithNotice(projectId, branch)
+          : { projectId: undefined, notice: undefined };
+        const result = await findArchitecturalIssues(this.metricsManager, { project: resolvedProject, limit, offset });
+        return notice
+          ? this.textResult(notice, (result.content?.[0] as any)?.text ?? '')
+          : result;
       }
     );
 
     // Tool: List projects  
     server.tool(
       'list_projects',
-      'List all projects in the CodeRAG graph database with optional statistics.',
+      'ENTRY POINT: List all projects in the CodeRAG graph database with optional statistics. ' +
+        'Call this first — it asks the user (via elicitation) which project to use, so the chosen ' +
+        'project can be passed to subsequent project-scoped tools.',
       {
         includeStats: z.boolean().optional(),
         sortBy: z.enum(['name', 'created_at', 'updated_at', 'entity_count']).optional(),
         limit: z.number().optional()
       },
       async ({ includeStats = false, sortBy = 'name', limit = 100 }) => {
-        const { listProjects } = await import('./tools/list-projects.js');
         const result = await listProjects(this.client, { 
           include_stats: includeStats, 
           sort_by: sortBy, 
           limit 
         });
+        const selectionNotice = await this.elicitSessionProject(result);
+        const payload = JSON.stringify(result, null, 2);
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify(result, null, 2)
+            text: selectionNotice ? `${selectionNotice}\n\n${payload}` : payload
           }]
         };
       }
@@ -472,10 +681,10 @@ export class HTTPHandler {
         branch: z.string().optional().describe('Optional: Git branch to query (e.g. current local branch). Falls back to default/indexed branch.')
       },
       async ({ project, branch }) => {
-        const { notice } = project
+        const { projectId: resolvedProject, notice } = project
           ? await this.resolveWithNotice(project, branch)
-          : { notice: undefined };
-        const result = await this.metricsManager.calculateProjectSummary();
+          : { projectId: undefined, notice: undefined };
+        const result = await this.metricsManager.calculateProjectSummary(resolvedProject);
         return this.textResult(notice, result);
       }
     );
@@ -801,6 +1010,22 @@ Ready to start scanning?`
   }
 
 
+  /**
+   * Coerce a session-id value coming from a header or query string into a single
+   * valid string. Guards against:
+   *  - duplicate headers/params (Express exposes them as string[]),
+   *  - non-string junk (e.g. a .NET client sending the literal "System.String[]").
+   * Returns undefined when no usable id is present.
+   */
+  private normalizeSessionId(value: unknown): string | undefined {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (typeof raw !== 'string') return undefined;
+    const trimmed = raw.trim();
+    // Reject obviously invalid values that could only come from client bugs.
+    if (!trimmed || trimmed === 'System.String[]') return undefined;
+    return trimmed;
+  }
+
   private setupRoutes(): void {
     // Health check endpoint
     this.app.get('/health', (req, res) => {
@@ -940,19 +1165,28 @@ Ready to start scanning?`
     // Streamable HTTP Transport endpoints - exactly following the official SDK example
     this.app.post('/mcp', async (req, res) => {
       try {
-        // Check for sessionId in query params or headers
-        const querySessionId = req.query.sessionId as string;
-        const headerSessionId = req.headers['mcp-session-id'] as string;
-        const sessionId = querySessionId || headerSessionId;
-        
+        // Normalize session IDs: a misbehaving client or proxy can send the
+        // header/query value more than once (Express then exposes it as an
+        // array) or serialize a non-string value (e.g. a .NET client sending
+        // the literal "System.String[]"). Coerce to a single, valid string so
+        // we never accidentally key the transport map with garbage.
+        const querySessionId = this.normalizeSessionId(req.query.sessionId);
+        const headerSessionId = this.normalizeSessionId(req.headers['mcp-session-id']);
+        const sessionId = headerSessionId || querySessionId;
 
         let transport: StreamableHTTPServerTransport;
-        
-        if (headerSessionId && this.streamableTransports[headerSessionId]) {
+
+        if (sessionId && this.streamableTransports[sessionId]) {
           // Reuse existing transport
-          transport = this.streamableTransports[headerSessionId];
+          transport = this.streamableTransports[sessionId];
         } else if (!sessionId && isInitializeRequest(req.body)) {
-          // New initialization request
+          // New initialization request. Each session MUST get its own dedicated
+          // McpServer instance. Reusing a single shared server would re-bind that
+          // server to every new transport on each initialize, silently breaking
+          // all previously established sessions (this caused the session churn
+          // seen in the logs). The SSE path already does this correctly.
+          const dedicatedServer = this.createServer();
+
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sessionId) => {
@@ -961,7 +1195,7 @@ Ready to start scanning?`
               console.log('📋 Current streamable transports:', Object.keys(this.streamableTransports));
             }
           });
-          
+
           transport.onclose = () => {
             const sid = transport.sessionId;
             if (sid && this.streamableTransports[sid]) {
@@ -969,13 +1203,31 @@ Ready to start scanning?`
               delete this.streamableTransports[sid];
             }
           };
-          
-          // Connect the transport to the MCP server BEFORE handling the request
-          await this.server.connect(transport);
+
+          // Connect the dedicated transport to the dedicated MCP server BEFORE
+          // handling the request.
+          await dedicatedServer.connect(transport);
           await transport.handleRequest(req, res, req.body);
           return; // Already handled
+        } else if (sessionId) {
+          // A session ID was provided but we have no matching transport. This is
+          // an expired/unknown session (e.g. after a server restart or a client
+          // that cached a stale ID). Per the Streamable HTTP spec, answer 404 so
+          // a compliant client discards the ID and cleanly re-initializes,
+          // instead of getting stuck retrying with a dead session.
+          console.log('❌ Unknown/expired session - client should re-initialize');
+          console.log('  sessionId:', sessionId);
+          res.status(404).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32001,
+              message: 'Session not found: please re-initialize',
+            },
+            id: null,
+          });
+          return;
         } else {
-          // Invalid request - no session ID or not initialization request
+          // No session ID and not an initialization request.
           console.log('❌ Bad request - no session ID or not initialize request');
           console.log('  sessionId:', sessionId);
           console.log('  isInitialize:', isInitializeRequest(req.body));
@@ -1010,8 +1262,8 @@ Ready to start scanning?`
 
     // Streamable HTTP Transport: GET /mcp - Establish SSE stream for existing session
     this.app.get('/mcp', async (req, res) => {
-      const headerSessionId = req.headers['mcp-session-id'] as string;
-      const querySessionId = req.query.sessionId as string;
+      const headerSessionId = this.normalizeSessionId(req.headers['mcp-session-id']);
+      const querySessionId = this.normalizeSessionId(req.query.sessionId);
       
       console.log('🟢 Streamable HTTP GET /mcp:');
       console.log('  headerSessionId:', headerSessionId);
@@ -1033,7 +1285,7 @@ Ready to start scanning?`
 
     // Streamable HTTP Transport: DELETE /mcp - Session termination
     this.app.delete('/mcp', async (req, res) => {
-      const sessionId = req.headers['mcp-session-id'] as string;
+      const sessionId = this.normalizeSessionId(req.headers['mcp-session-id']);
       if (!sessionId || !this.streamableTransports[sessionId]) {
         res.status(400).send('Invalid or missing session ID');
         return;

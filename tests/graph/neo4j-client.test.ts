@@ -79,7 +79,8 @@ describe('Neo4jClient', () => {
           maxConnectionPoolSize: 50,
           connectionAcquisitionTimeout: 60_000,
           connectionTimeout: 20_000,
-          maxConnectionLifetime: 60 * 60 * 1000
+          maxConnectionLifetime: 3 * 60 * 1000,
+          connectionLivenessCheckTimeout: 30_000
         })
       );
       expect(mockDriver.verifyConnectivity).toHaveBeenCalled();
@@ -165,7 +166,7 @@ describe('Neo4jClient', () => {
     test('should create constraints and indexes', async () => {
       await client.connect();
       await client.initializeDatabase();
-      expect(mockSession.run).toHaveBeenCalledTimes(13); // Number of constraints + indexes
+      expect(mockSession.run).toHaveBeenCalledTimes(14); // Number of constraints + indexes + full-text index
     });
   });
 

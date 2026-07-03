@@ -4,10 +4,12 @@ import { createPaginatedResponse } from '../../utils/token-limiter.js';
 // Metrics Analysis Tool Parameters
 export interface CalculateCKMetricsParams {
   classId: string;
+  projectId?: string;
 }
 
 export interface CalculatePackageMetricsParams {
   packageName: string;
+  projectId?: string;
 }
 
 export interface GetProjectSummaryParams {
@@ -81,7 +83,7 @@ export async function calculateCKMetrics(
   params: CalculateCKMetricsParams,
   detailLevel: 'detailed' | 'simple' = 'simple'
 ) {
-  const result = await metricsManager.calculateCKMetrics(params.classId);
+  const result = await metricsManager.calculateCKMetrics(params.classId, params.projectId);
   
   if (detailLevel === 'detailed') {
     return {
@@ -122,7 +124,7 @@ export async function calculatePackageMetrics(
   params: CalculatePackageMetricsParams,
   detailLevel: 'detailed' | 'simple' = 'simple'
 ) {
-  const result = await metricsManager.calculatePackageMetrics(params.packageName);
+  const result = await metricsManager.calculatePackageMetrics(params.packageName, params.projectId);
   
   if (detailLevel === 'detailed') {
     return {
@@ -159,9 +161,9 @@ ${JSON.stringify(result, null, 2)}`
 
 export async function findArchitecturalIssues(
   metricsManager: MetricsManager,
-  params: { limit?: number; offset?: number } = {}
+  params: { limit?: number; offset?: number; project?: string } = {}
 ) {
-  const result = await metricsManager.findArchitecturalIssues();
+  const result = await metricsManager.findArchitecturalIssues(params.project);
   const paginated = createPaginatedResponse(result, params.offset || 0, params.limit);
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(paginated, null, 2) }]
@@ -173,7 +175,7 @@ export async function getProjectSummary(
   params: GetProjectSummaryParams,
   detailLevel: 'detailed' | 'simple' = 'simple'
 ) {
-  const result = await metricsManager.calculateProjectSummary();
+  const result = await metricsManager.calculateProjectSummary(params.project);
   
   if (detailLevel === 'detailed') {
     return {

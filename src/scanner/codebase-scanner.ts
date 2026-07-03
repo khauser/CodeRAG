@@ -24,6 +24,16 @@ import { ProjectLanguageDetector } from './detection/language-detector.js';
 import { ProjectBuildFileDetector } from './detection/build-file-detector.js';
 import { GitRepositoryManager, GitAuthConfig } from './git/index.js';
 
+/** Local wall-clock timestamp prefix for console logs, e.g. "[14:03:27]". */
+function ts(): string {
+  return `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}]`;
+}
+
+/** Format a millisecond duration as a human-readable string, e.g. "1.23s" or "350ms". */
+function fmtDuration(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
+}
+
 export class CodebaseScanner {
   private parsers: Map<Language, LanguageParser>;
   private nodeManager: NodeManager;
@@ -131,8 +141,10 @@ export class CodebaseScanner {
 
         // Store incrementally to keep memory usage bounded
         if (filesProcessed % storeBatchSize < fileBatchSize && pendingEntities.length > 0) {
-          console.log(`💾 Storing batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships (${filesProcessed}/${files.length} files)...`);
-          const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings);
+          console.log(`${ts()} 💾 Storing batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships (${filesProcessed}/${files.length} files)...`);
+          const batchStart = Date.now();
+          const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings, actualConfig.includeExternalSymbols);
+          console.log(`${ts()} ✅ Batch stored in ${fmtDuration(Date.now() - batchStart)}`);
           for (const err of storeErrors) {
             allErrors.push(err);
           }
@@ -149,8 +161,10 @@ export class CodebaseScanner {
 
       // Store remaining entities/relationships
       if (pendingEntities.length > 0) {
-        console.log(`💾 Storing final batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships...`);
-        const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings);
+        console.log(`${ts()} 💾 Storing final batch: ${pendingEntities.length} entities, ${pendingRelationships.length} relationships...`);
+        const finalBatchStart = Date.now();
+        const storeErrors = await this.storeInGraph(pendingEntities, pendingRelationships, actualConfig.skipEmbeddings, actualConfig.includeExternalSymbols);
+        console.log(`${ts()} ✅ Final batch stored in ${fmtDuration(Date.now() - finalBatchStart)}`);
         for (const err of storeErrors) {
           allErrors.push(err);
         }
@@ -491,8 +505,13 @@ export class CodebaseScanner {
     return null;
   }
 
-  private async storeInGraph(entities: ParsedEntity[], relationships: ParsedRelationship[], skipEmbeddings?: boolean): Promise<any[]> {
-    console.log(`📥 Storing entities...`);
+  private async storeInGraph(
+    entities: ParsedEntity[],
+    relationships: ParsedRelationship[],
+    skipEmbeddings?: boolean,
+    includeExternalSymbols: boolean = true
+  ): Promise<any[]> {
+    console.log(`${ts()} 📥 Storing entities...`);
     const errors: any[] = [];
     
     // Deduplicate entities by ID + project_id
@@ -505,7 +524,7 @@ export class CodebaseScanner {
     }
     const deduplicatedEntities = Array.from(entityMap.values());
     
-    console.log(`📥 Deduplicated ${entities.length} entities to ${deduplicatedEntities.length}`);
+    console.log(`${ts()} 📥 Deduplicated ${entities.length} entities to ${deduplicatedEntities.length}`);
     
     // Debug: log entity type counts
     const entityTypeCounts = deduplicatedEntities.reduce((acc, e) => {
@@ -516,6 +535,7 @@ export class CodebaseScanner {
     
     // Store entities using batch UNWIND for high throughput
     const successfullyStoredEntities: ParsedEntity[] = [];
+    const entityStoreStart = Date.now();
     const nodeBatchResult = await this.nodeManager.addNodesBatch(
       deduplicatedEntities.map(entity => ({
         id: entity.id,
@@ -528,13 +548,15 @@ export class CodebaseScanner {
         start_line: entity.start_line,
         end_line: entity.end_line,
         modifiers: entity.modifiers,
-        is_abstract: (entity.modifiers || []).includes('abstract'),
+        is_abstract: entity.is_abstract
+          ?? ((entity.modifiers || []).includes('abstract') || entity.type === 'interface'),
         attributes: entity.attributes
       }))
     );
 
     // Track successfully stored entities for embedding generation
     const failedEntityIds = new Set(nodeBatchResult.errors.map(e => e.node.id));
+    console.log(`${ts()} 📥 Stored ${deduplicatedEntities.length} entities in ${fmtDuration(Date.now() - entityStoreStart)}`);
     for (const entity of deduplicatedEntities) {
       if (!failedEntityIds.has(entity.id)) {
         successfullyStoredEntities.push(entity);
@@ -551,7 +573,7 @@ export class CodebaseScanner {
       });
     }
 
-    console.log(`🔗 Storing relationships...`);
+    console.log(`${ts()} 🔗 Storing relationships...`);
     
     // Deduplicate relationships by ID + project_id
     const relationshipMap = new Map<string, ParsedRelationship>();
@@ -570,44 +592,54 @@ export class CodebaseScanner {
     // interface shipped as a JAR, or a method in another cartridge), create a
     // lightweight stub node so the edge can be stored and later queried.
     // We use the project_id of the source entity as the owner.
+    //
+    // When includeExternalSymbols is false, we skip stub creation entirely:
+    // edges whose target is not a scanned project entity are dropped further
+    // below. This keeps the graph limited to project code and avoids pulling in
+    // external dependency classes (Spring, Jackson, ...) as RAG noise.
     const stubsToStore: ParsedEntity[] = [];
-    for (const r of deduplicatedRelationships) {
-      if (!entityIds.has(r.target)) {
-        // Determine stub type based on edge type
-        let stubType: 'class' | 'interface' | 'method';
-        if (r.type === 'implements' || r.type === 'extends') {
-          stubType = 'interface';
-        } else if (r.type === 'calls') {
-          stubType = 'method';
-        } else if (r.type === 'references') {
-          stubType = 'class';
-        } else {
-          // Skip other edge types (contains, belongs_to, etc.) — their targets
-          // should always be in the same scan batch
-          continue;
-        }
+    if (includeExternalSymbols) {
+      for (const r of deduplicatedRelationships) {
+        if (!entityIds.has(r.target)) {
+          // Determine stub type based on edge type
+          let stubType: 'class' | 'interface' | 'method';
+          if (r.type === 'implements' || r.type === 'extends') {
+            stubType = 'interface';
+          } else if (r.type === 'calls') {
+            stubType = 'method';
+          } else if (r.type === 'references') {
+            stubType = 'class';
+          } else {
+            // Skip other edge types (contains, belongs_to, etc.) — their targets
+            // should always be in the same scan batch
+            continue;
+          }
 
-        // Derive project_id from the source entity
-        const sourceEntity = deduplicatedEntities.find(e => e.id === r.source);
-        const projectId = sourceEntity?.project_id ?? r.project_id;
-        const stub: ParsedEntity = {
-          id: r.target,
-          project_id: projectId,
-          type: stubType,
-          name: r.target.split('.').pop() ?? r.target,
-          qualified_name: r.target,
-          source_file: 'external',
-          modifiers: [],
-          annotations: []
-        };
-        entityIds.add(r.target); // prevent duplicates in subsequent loop iterations
-        stubsToStore.push(stub);
+          // Derive project_id from the source entity
+          const sourceEntity = deduplicatedEntities.find(e => e.id === r.source);
+          const projectId = sourceEntity?.project_id ?? r.project_id;
+          const stub: ParsedEntity = {
+            id: r.target,
+            project_id: projectId,
+            type: stubType,
+            name: r.target.split('.').pop() ?? r.target,
+            qualified_name: r.target,
+            source_file: 'external',
+            modifiers: [],
+            annotations: []
+          };
+          entityIds.add(r.target); // prevent duplicates in subsequent loop iterations
+          stubsToStore.push(stub);
+        }
       }
     }
 
     if (stubsToStore.length > 0) {
       console.log(`📋 Creating ${stubsToStore.length} stub nodes for external/cross-cartridge targets`);
-      await this.nodeManager.addNodesBatch(
+      // Use ON CREATE-only semantics so a stub never downgrades a real node that
+      // was parsed in an earlier scan (e.g. turning an interface/enum into a class
+      // and marking it "external").
+      await this.nodeManager.addStubNodesBatch(
         stubsToStore.map(stub => ({
           id: stub.id,
           project_id: stub.project_id,
@@ -646,11 +678,12 @@ export class CodebaseScanner {
       }
     }
     
-    console.log(`📋 Storing ${storableRelationships.length} relationships`);
+    console.log(`${ts()} 📋 Storing ${storableRelationships.length} relationships`);
 
     // Batch-insert relationships grouped by type using UNWIND queries.
     // This replaces the previous one-by-one approach and reduces DB round-trips
     // from N to ceil(N / 500) * numTypes.
+    const relStoreStart = Date.now();
     const edgeBatchResult = await this.edgeManager.addEdgesBatch(
       storableRelationships.map(r => ({
         id: r.id,
@@ -663,6 +696,7 @@ export class CodebaseScanner {
     );
 
     const storedCount = edgeBatchResult.stored;
+    console.log(`${ts()} 🔗 Stored ${storedCount} relationships in ${fmtDuration(Date.now() - relStoreStart)}`);
 
     for (const { edge, error } of edgeBatchResult.errors) {
       if (!error.includes('already exists')) {
@@ -680,9 +714,9 @@ export class CodebaseScanner {
 
     // Generate embeddings if semantic search is enabled and not skipped
     if (skipEmbeddings) {
-      console.log(`🧠 Skipping embedding generation (--no-embeddings flag)`);
+      console.log(`${ts()} 🧠 Skipping embedding generation (--no-embeddings flag)`);
     } else if (this.embeddingService.isEnabled()) {
-      console.log(`🧠 Generating semantic embeddings for ${successfullyStoredEntities.length} entities...`);
+      console.log(`${ts()} 🧠 Generating semantic embeddings for ${successfullyStoredEntities.length} entities...`);
       try {
         // Ensure the Neo4j vector index exists before embeddings are written.
         // Without this index, db.index.vector.queryNodes (used by semantic search

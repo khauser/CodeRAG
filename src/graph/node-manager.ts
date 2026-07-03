@@ -158,6 +158,88 @@ export class NodeManager {
     return { stored: totalStored, errors };
   }
 
+  /**
+   * Batch-inserts *stub* nodes for external / cross-cartridge reference targets.
+   *
+   * Unlike {@link addNodesBatch}, this uses `ON CREATE SET` semantics so that a
+   * stub NEVER overwrites a node that was already parsed from real source code.
+   * Previously, a stub (type='class', source_file='external') stored after a
+   * real node had been scanned in an earlier run would clobber the real node's
+   * type (e.g. downgrading an `interface`/`enum` to `class`) and mark it
+   * `external`. With ON CREATE SET, existing nodes are left untouched and only
+   * genuinely new (truly external) targets receive stub properties.
+   *
+   * Returns the number of nodes processed (created or already existing).
+   */
+  async addStubNodesBatch(
+    nodes: CodeNode[],
+    batchSize = 200
+  ): Promise<{ stored: number; errors: Array<{ node: CodeNode; error: string }> }> {
+    if (nodes.length === 0) return { stored: 0, errors: [] };
+
+    const byType = new Map<string, CodeNode[]>();
+    for (const node of nodes) {
+      const t = node.type;
+      if (!byType.has(t)) byType.set(t, []);
+      byType.get(t)!.push(node);
+    }
+
+    let totalStored = 0;
+    const errors: Array<{ node: CodeNode; error: string }> = [];
+
+    for (const [type, typeNodes] of byType) {
+      const nodeLabel = this.getNodeLabel(type as CodeNode['type']);
+
+      for (let i = 0; i < typeNodes.length; i += batchSize) {
+        const batch = typeNodes.slice(i, i + batchSize);
+        const projectId = batch[0].project_id;
+        const projectLabel = this.client.getProjectLabel(projectId, type as CodeNode['type']);
+
+        const rows = batch.map(n => ({
+          id: n.id,
+          project_id: n.project_id,
+          type: n.type,
+          name: n.name,
+          qualified_name: n.qualified_name,
+          source_file: n.source_file || 'external',
+          modifiers: n.modifiers || [],
+          is_abstract: n.is_abstract ?? false,
+          attributes_json: JSON.stringify(n.attributes || {})
+        }));
+
+        // ON CREATE SET only: never overwrite a real, already-parsed node.
+        const query = `
+          UNWIND $rows AS row
+          MERGE (n:CodeNode { project_id: row.project_id, id: row.id })
+          ON CREATE SET n:${nodeLabel}:${projectLabel},
+              n.type = row.type,
+              n.name = row.name,
+              n.qualified_name = row.qualified_name,
+              n.source_file = row.source_file,
+              n.modifiers = row.modifiers,
+              n.is_abstract = row.is_abstract,
+              n.attributes_json = row.attributes_json
+          RETURN row.id AS id
+        `;
+
+        try {
+          const result = await this.client.runQuery(
+            query,
+            this.ensurePlainObject({ rows })
+          );
+          totalStored += result.records.length;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          for (const node of batch) {
+            errors.push({ node, error: message });
+          }
+        }
+      }
+    }
+
+    return { stored: totalStored, errors };
+  }
+
   async updateNode(nodeId: string, projectId: string, updates: Partial<CodeNode>): Promise<CodeNode> {
     const setParts: string[] = [];
     const parameters: Record<string, any> = { id: nodeId };
@@ -237,6 +319,69 @@ export class NodeManager {
   }
 
   async searchNodes(searchTerm: string, projectId: string): Promise<CodeNode[]> {
+    // Fast path: use the full-text index `codeNodeSearch` (created in
+    // Neo4jClient.initializeDatabase). Plain CONTAINS matching is not backed by the
+    // range indexes, so on large projects (e.g. icm-as) it scans every CodeNode —
+    // including large description fields — and exceeds the MCP request timeout.
+    // The full-text index turns this into an indexed lookup. Wildcards (`*term*`) keep
+    // the previous substring semantics so partial names still match.
+    const lucene = NodeManager.buildFulltextQuery(searchTerm);
+    if (lucene) {
+      const fulltextQuery = `
+        CALL db.index.fulltext.queryNodes('codeNodeSearch', $lucene) YIELD node, score
+        WHERE node.project_id = $project_id
+        RETURN node AS n
+        ORDER BY
+          CASE WHEN node.name = $searchTerm THEN 0
+               WHEN node.name STARTS WITH $searchTerm THEN 1
+               WHEN node.name CONTAINS $searchTerm THEN 2
+               ELSE 3 END,
+          score DESC,
+          node.name
+        LIMIT 100
+      `;
+      try {
+        const result = await this.client.runQuery(fulltextQuery, {
+          lucene,
+          searchTerm,
+          project_id: projectId
+        });
+        return result.records.map(record => this.recordToNode(record.get('n')));
+      } catch (error) {
+        // Full-text index missing (e.g. legacy DB not yet re-initialized) or query
+        // rejected — fall back to the CONTAINS query below for correctness.
+        console.error('Full-text search failed, falling back to CONTAINS:', error);
+      }
+    }
+
+    return this.searchNodesContains(searchTerm, projectId);
+  }
+
+  /**
+   * Builds a Lucene query string for the `codeNodeSearch` full-text index that
+   * preserves the substring semantics of the previous CONTAINS-based search.
+   * Each whitespace-separated term is escaped and wrapped in wildcards (`*term*`).
+   * Returns undefined when the search term contains no usable characters.
+   */
+  private static buildFulltextQuery(searchTerm: string): string | undefined {
+    const terms = (searchTerm || '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(term => {
+        // Escape Lucene special characters so identifiers like "Foo(int)" are safe.
+        const escaped = term.replace(/([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)/g, '\\$1');
+        return `*${escaped}*`;
+      });
+    if (terms.length === 0) return undefined;
+    return terms.join(' AND ');
+  }
+
+  /**
+   * Original substring search using CONTAINS. Retained as a fallback for databases
+   * whose full-text index has not been created yet.
+   */
+  private async searchNodesContains(searchTerm: string, projectId: string): Promise<CodeNode[]> {
     const query = `
       MATCH (n:CodeNode {project_id: $project_id})
       WHERE n.name CONTAINS $searchTerm 
