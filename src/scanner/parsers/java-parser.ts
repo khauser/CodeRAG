@@ -16,10 +16,49 @@ export class JavaParser extends BaseLanguageParser {
   private fieldParser = new JavaFieldParser();
   private methodCallExtractor = new JavaMethodCallExtractor();
   private createdPackages: Map<string, Set<string>> = new Map();
+  // Project-wide index of declared method return types, keyed by project id then
+  // by `${classQN}.${method}` -> return type FQN. Populated by a signature
+  // pre-pass and while parsing each file; consumed by the AST call extractor to
+  // resolve chained cross-cartridge calls (`a().b()`) — Defect 4d.
+  private returnTypeIndex: Map<string, Map<string, string>> = new Map();
 
   canParse(filePath: string): boolean {
     const ext = path.extname(filePath).toLowerCase();
     return ext === '.java';
+  }
+
+  /** Returns (creating if needed) the return-type index for a project. */
+  private getReturnTypeIndex(projectId: string): Map<string, string> {
+    let index = this.returnTypeIndex.get(projectId);
+    if (!index) {
+      index = new Map<string, string>();
+      this.returnTypeIndex.set(projectId, index);
+    }
+    return index;
+  }
+
+  /**
+   * Signature-only pre-pass over a single file: records its declared method
+   * return types into the project-wide index without emitting entities/edges.
+   * The scanner runs this over all Java files before the main parse so chained
+   * cross-cartridge calls resolve regardless of file processing order.
+   */
+  async collectSignatures(filePath: string, content: string, projectId: string): Promise<void> {
+    try {
+      const trimmed = content.trim();
+      if (trimmed === '') return;
+      const extractionResult = this.contentExtractor.extractContent(content, filePath);
+      const packageName = extractionResult.packageName || this.getPackageFromPath(filePath);
+      await this.methodParser.collectSignatures(
+        content,
+        filePath,
+        packageName,
+        this.getReturnTypeIndex(projectId)
+      );
+    } catch {
+      // A failed signature pre-pass simply leaves those return types unresolved;
+      // the main parse still runs and safely drops any unresolved tail calls.
+    }
   }
 
   async parseFile(filePath: string, content: string, projectId: string): Promise<{
@@ -85,7 +124,8 @@ export class JavaParser extends BaseLanguageParser {
       await this.methodParser.parseMethods(
         content, filePath, packageName, entities, relationships,
         (entity) => this.addEntity(entities, entity),
-        (rel) => this.addRelationship(relationships, rel)
+        (rel) => this.addRelationship(relationships, rel),
+        this.getReturnTypeIndex(projectId)
       );
 
       this.fieldParser.parseFields(

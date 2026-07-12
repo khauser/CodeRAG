@@ -15,6 +15,13 @@ interface Case {
   name: string;
   source: string;
   methodSuffix: string;
+  /**
+   * Additional files whose method signatures are collected into the project-wide
+   * return-type index BEFORE the main source is parsed. This mirrors the scanner's
+   * signature pre-pass and enables cross-cartridge chained-call resolution
+   * (Defect 4d): a().b() where a()'s return type is declared in another file.
+   */
+  signatureFiles?: { path: string; source: string }[];
   expectPresent?: string[];      // exact targets that must be present
   expectPresentEndsWith?: string[]; // targets that must be present (suffix match)
   expectAbsentEndsWith?: string[];  // targets that must NOT be present (suffix match)
@@ -75,7 +82,7 @@ public class Svc {
     expectPresent: ['com.acme.Svc.helper'],
   },
   {
-    name: 'chained getter with cross-file return type: head emitted, tail dropped (no guessed type)',
+    name: 'chained getter with cross-file return type, NO signature pre-pass: head emitted, tail dropped (no guessed type)',
     methodSuffix: '.Svc.run',
     source: `package com.acme;
 public class Svc {
@@ -85,13 +92,13 @@ public class Svc {
 }`,
     // getSite()'s receiver is the typed param, so the head call is emitted.
     expectPresentEndsWith: ['.ApplicationBO.getSite'],
-    // getSite()'s return type is declared in another file (unavailable here), so
-    // the tail call must NOT be emitted with a type invented from the getter name
-    // (e.g. `com.acme.Site.getDomainName`).
+    // getSite()'s return type is declared in another file that was NOT scanned for
+    // signatures here, so the tail call must NOT be emitted with a type invented
+    // from the getter name (e.g. `com.acme.Site.getDomainName`).
     expectAbsentEndsWith: ['.Site.getDomainName', '.getDomainName'],
   },
   {
-    name: 'static getter chain: head emitted, tail dropped (no lexical CurrentAppContext type)',
+    name: 'static getter chain, NO signature pre-pass: head emitted, tail dropped (no lexical CurrentAppContext type)',
     methodSuffix: '.Svc.run',
     source: `package com.acme;
 import com.acme.app.AppContextUtil;
@@ -101,9 +108,87 @@ public class Svc {
   }
 }`,
     expectPresentEndsWith: ['.AppContextUtil.getCurrentAppContext'],
-    // getCurrentAppContext()'s return type is cross-file, so getVariable must not
-    // be emitted against a type synthesized from the getter name.
+    // getCurrentAppContext()'s return type is cross-file and unscanned, so
+    // getVariable must not be emitted against a type synthesized from the getter.
     expectAbsentEndsWith: ['.CurrentAppContext.getVariable', '.getVariable'],
+  },
+  {
+    // Defect 4d: with a signature pre-pass over the (other-cartridge) declaring
+    // files, the intermediate method's declared return type is known, so the tail
+    // call resolves to the real cross-cartridge type. Mirrors the reference
+    // GetProductTaxRate.execute example.
+    name: 'Defect 4d: cross-cartridge chained tail resolves via signature pre-pass',
+    methodSuffix: '.GetProductTaxRate.execute',
+    signatureFiles: [
+      {
+        path: '/platform/core/AppContextUtil.java',
+        source: `package com.intershop.beehive.core.capi.app;
+public class AppContextUtil {
+  public static AppContext getCurrentAppContext() { return null; }
+}`,
+      },
+      {
+        // Bodyless interface signature in another cartridge; return type Domain is
+        // imported from a third package (method's own import scope is used).
+        path: '/platform/bc_application/ApplicationBO.java',
+        source: `package com.intershop.component.application.capi;
+import com.intershop.beehive.core.capi.domain.Domain;
+public interface ApplicationBO {
+  Domain getSite();
+}`,
+      },
+    ],
+    source: `package com.intershop.component.b2b.pipelet.taxation;
+import com.intershop.beehive.core.capi.app.AppContextUtil;
+import com.intershop.component.application.capi.ApplicationBO;
+public class GetProductTaxRate extends Pipelet {
+  public int execute(PipelineDictionary dict) throws PipeletExecutionException {
+    Object ctxVar = AppContextUtil.getCurrentAppContext().getVariable(ApplicationBO.CURRENT);
+    ApplicationBO application = dict.getRequired("ApplicationBO");
+    String domainName = application.getSite().getDomainName();
+    return PIPELET_NEXT;
+  }
+}`,
+    expectPresent: [
+      // AC1 + AC2: tail calls resolve to the real cross-cartridge return types.
+      'com.intershop.beehive.core.capi.app.AppContext.getVariable',
+      'com.intershop.beehive.core.capi.domain.Domain.getDomainName',
+      // AC4: intermediate calls remain.
+      'com.intershop.beehive.core.capi.app.AppContextUtil.getCurrentAppContext',
+      'com.intershop.component.application.capi.ApplicationBO.getSite',
+    ],
+    // AC3: no lexical getter-name guesses placed in the caller's package.
+    expectAbsentEndsWith: [
+      'taxation.CurrentAppContext.getVariable',
+      'taxation.Site.getDomainName',
+    ],
+  },
+  {
+    // Defect 4d generic form: x.a().b() where a()'s return type is an interface in
+    // cartridge B (itself importing its return type from cartridge C).
+    name: 'Defect 4d: generic multi-cartridge chain x.a().b() resolves b() into cartridge B',
+    methodSuffix: '.Caller.run',
+    signatureFiles: [
+      {
+        path: '/b/Beta.java',
+        source: `package com.example.b;
+import com.example.c.Gamma;
+public interface Beta { Gamma a(); }`,
+      },
+      {
+        path: '/c/Gamma.java',
+        source: `package com.example.c;
+public interface Gamma { void b(); }`,
+      },
+    ],
+    source: `package com.example.a;
+import com.example.b.Beta;
+public class Caller {
+  public void run(Beta x) {
+    x.a().b();
+  }
+}`,
+    expectPresent: ['com.example.b.Beta.a', 'com.example.c.Gamma.b'],
   },
   {
     name: 'internal getter with in-file return type imported from another package: tail uses declared type package',
@@ -144,10 +229,15 @@ class C { void d() {} }`,
 ];
 
 async function main(): Promise<void> {
-  const parser = new JavaParser();
   let failures = 0;
 
   for (const c of cases) {
+    // Use a fresh parser per case so the project-wide return-type index only
+    // contains the signatures explicitly declared for this case.
+    const parser = new JavaParser();
+    for (const sig of c.signatureFiles ?? []) {
+      await parser.collectSignatures(sig.path, sig.source, 'verify');
+    }
     const result = await parser.parseFile('/verify/Svc.java', c.source, 'verify');
     const targets = result.relationships
       .filter(r => r.type === 'calls' && r.source.endsWith(c.methodSuffix))

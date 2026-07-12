@@ -112,6 +112,12 @@ export class CodebaseScanner {
       const files = await this.findSourceFiles(actualConfig);
       console.log(`📁 Found ${files.length} source files`);
 
+      // Java signature pre-pass: build a project-wide method return-type index so
+      // chained cross-cartridge calls (`a().b()`) resolve `b()`'s receiver type
+      // from `a()`'s declared return type regardless of file processing order
+      // (Defect 4d). Skipped when no Java files are present.
+      await this.collectJavaSignatures(files, actualConfig);
+
       // Process and store files in streaming batches to avoid heap overflow
       const fileBatchSize = 50;
       const storeBatchSize = 1000; // Store to DB every N files
@@ -456,6 +462,39 @@ export class CodebaseScanner {
     }
 
     return patterns;
+  }
+
+  /**
+   * Java signature pre-pass: parses every Java file once to record declared
+   * method return types into the parser's project-wide index. This must run
+   * before the main parse so that chained cross-cartridge calls (`a().b()`) can
+   * resolve the receiver type of `b()` from `a()`'s declared return type,
+   * independently of the (parallel, unordered) file processing in the main loop.
+   */
+  private async collectJavaSignatures(files: string[], config: ScanConfig): Promise<void> {
+    const javaParser = this.parsers.get('java') as JavaParser | undefined;
+    if (!javaParser) return;
+
+    const javaFiles = files.filter(f => javaParser.canParse(f));
+    if (javaFiles.length === 0) return;
+
+    console.log(`🧭 Java signature pre-pass over ${javaFiles.length} files...`);
+    const start = Date.now();
+    const batchSize = 50;
+    for (let i = 0; i < javaFiles.length; i += batchSize) {
+      const batch = javaFiles.slice(i, i + batchSize);
+      await Promise.all(batch.map(async (filePath) => {
+        try {
+          const content = await fs.promises.readFile(filePath, 'utf-8');
+          const relativePath = path.relative(config.projectPath, filePath).replace(/\\/g, '/');
+          await javaParser.collectSignatures(relativePath, content, config.projectId);
+        } catch {
+          // A failed signature read/parse just leaves those return types
+          // unresolved; the main parse still runs and safely drops the tail call.
+        }
+      }));
+    }
+    console.log(`🧭 Java signature pre-pass complete in ${fmtDuration(Date.now() - start)}`);
   }
 
   private async processFile(filePath: string, config: ScanConfig): Promise<{

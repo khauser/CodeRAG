@@ -13,6 +13,14 @@ type ParseFn = (code: string) => CstNode;
  */
 export type TypeResolver = (name: string) => string | null;
 
+/**
+ * Looks up the declared return type (fully-qualified) of a method identified by
+ * its fully-qualified name (`${classQN}.${methodName}`), or returns null when it
+ * is unknown. This is the seam that lets chained-call resolution reach return
+ * types declared in other cartridges/files (Defect 4d).
+ */
+export type ReturnTypeLookup = (methodQN: string) => string | null;
+
 interface ChainItem {
   name: string;
   call: boolean;
@@ -34,12 +42,14 @@ interface ClassScope {
  * (`a().b().c()`), resolve static calls (`Type.method(...)`), and follow
  * `.class`-mediated idioms such as `NamingMgr.get(TaxMgr.class).lookupTaxRates(...)`.
  *
- * Cross-file return types cannot be read from a single file. For chained calls
- * whose intermediate return type is not declared in the current file, the
- * receiver type of the tail call is left unresolved and the tail call is
- * dropped. The extractor never synthesizes a receiver type from the invoked
- * method's (getter) name, as that would place an invented type in the current
- * package (a missing edge is preferred over an incorrect one).
+ * Cross-file return types are resolved through a project-wide return-type index
+ * (`globalReturnTypes`) that is populated in a scan pre-pass and while parsing
+ * every file. For a chained call `a().b()` whose intermediate method `a()` is
+ * declared in a different cartridge, the receiver type of `b()` is taken from
+ * that method's declared return type recorded in the index (Defect 4d). When the
+ * return type genuinely cannot be determined (e.g. a compiled dependency that was
+ * never scanned), the tail call is dropped rather than guessed — the extractor
+ * never synthesizes a receiver type from the invoked method's (getter) name.
  */
 export class JavaAstCallExtractor {
   // ICM/JEE idioms where the concrete return type is passed as a `.class` literal
@@ -92,7 +102,8 @@ export class JavaAstCallExtractor {
     filePath: string,
     packageName: string,
     resolveType: TypeResolver,
-    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
+    globalReturnTypes?: Map<string, string>
   ): Promise<boolean> {
     const parse = await this.loadParser();
     if (!parse) return false;
@@ -113,6 +124,17 @@ export class JavaAstCallExtractor {
       const returnTypeMap = new Map<string, string>(); // `${classQN}.${method}` -> type
       this.collectClassInfo(cst, pkg, [], resolveType, classScopes, returnTypeMap);
 
+      // Share this file's declared return types with the project-wide index so
+      // other files' chained calls can resolve receiver types across cartridges.
+      if (globalReturnTypes) {
+        for (const [k, v] of returnTypeMap) globalReturnTypes.set(k, v);
+      }
+
+      // Return-type lookup: prefer the current file's model, then fall back to
+      // the project-wide index (methods declared in other cartridges/files).
+      const lookupReturnType: ReturnTypeLookup = (methodQN: string) =>
+        returnTypeMap.get(methodQN) ?? globalReturnTypes?.get(methodQN) ?? null;
+
       // Pass B: process each method body and emit CALLS edges.
       const emitted = new Set<string>();
       const emit = (source: string, target: string): void => {
@@ -122,10 +144,44 @@ export class JavaAstCallExtractor {
         addRelationship(RelationshipBuilder.createCalls(source, target, filePath));
       };
 
-      this.processMethods(cst, pkg, [], resolveType, classScopes, returnTypeMap, emit);
+      this.processMethods(cst, pkg, [], resolveType, classScopes, lookupReturnType, emit);
       return true;
     } catch {
       // Any unexpected CST shape -> fall back to regex extraction.
+      return false;
+    }
+  }
+
+  /**
+   * Signature-only pre-pass: parses the file and records every declared method's
+   * fully-qualified return type into the shared project-wide index, without
+   * emitting any edges. Running this over all Java files before CALLS extraction
+   * makes cross-cartridge chained-call resolution independent of file order.
+   *
+   * @returns true when the file was parsed, false when parsing failed.
+   */
+  async collectReturnTypes(
+    content: string,
+    packageName: string,
+    resolveType: TypeResolver,
+    globalReturnTypes: Map<string, string>
+  ): Promise<boolean> {
+    const parse = await this.loadParser();
+    if (!parse) return false;
+
+    let cst: CstNode;
+    try {
+      cst = parse(content);
+    } catch {
+      return false;
+    }
+
+    try {
+      const pkg = this.extractPackageName(cst) || packageName;
+      const classScopes = new Map<string, ClassScope>();
+      this.collectClassInfo(cst, pkg, [], resolveType, classScopes, globalReturnTypes);
+      return true;
+    } catch {
       return false;
     }
   }
@@ -155,7 +211,13 @@ export class JavaAstCallExtractor {
       classScopes.set(classQN, scope);
 
       // Method names + return types for this class (direct members only).
-      for (const method of this.findDirectDescendants(node, 'methodDeclaration')) {
+      // Interface methods (bodyless signatures, e.g. `Domain getSite();`) are
+      // included so their return types feed cross-cartridge chain resolution.
+      const methodDecls = [
+        ...this.findDirectDescendants(node, 'methodDeclaration'),
+        ...this.findDirectDescendants(node, 'interfaceMethodDeclaration')
+      ];
+      for (const method of methodDecls) {
         const name = this.methodName(method);
         if (!name) continue;
         scope.methodNames.add(name);
@@ -181,7 +243,7 @@ export class JavaAstCallExtractor {
     stack: string[],
     resolveType: TypeResolver,
     classScopes: Map<string, ClassScope>,
-    returnTypeMap: Map<string, string>,
+    lookupReturnType: ReturnTypeLookup,
     emit: (source: string, target: string) => void
   ): void {
     if (!node || !node.children) return;
@@ -195,7 +257,7 @@ export class JavaAstCallExtractor {
 
       if (scope) {
         for (const method of this.directMethods(node)) {
-          this.processMethod(method, scope, resolveType, returnTypeMap, emit);
+          this.processMethod(method, scope, resolveType, lookupReturnType, emit);
         }
       }
     }
@@ -203,7 +265,7 @@ export class JavaAstCallExtractor {
     for (const key of Object.keys(node.children)) {
       for (const child of node.children[key]) {
         if (child && child.children) {
-          this.processMethods(child, pkg, nextStack, resolveType, classScopes, returnTypeMap, emit);
+          this.processMethods(child, pkg, nextStack, resolveType, classScopes, lookupReturnType, emit);
         }
       }
     }
@@ -213,7 +275,7 @@ export class JavaAstCallExtractor {
     method: CstNode,
     scope: ClassScope,
     resolveType: TypeResolver,
-    returnTypeMap: Map<string, string>,
+    lookupReturnType: ReturnTypeLookup,
     emit: (source: string, target: string) => void
   ): void {
     const name = this.methodName(method) || this.constructorName(method);
@@ -229,7 +291,7 @@ export class JavaAstCallExtractor {
     if (!body) return;
 
     for (const primary of this.findDescendants(body, 'primary')) {
-      this.resolveChain(primary, methodId, scope, vars, resolveType, returnTypeMap, emit);
+      this.resolveChain(primary, methodId, scope, vars, resolveType, lookupReturnType, emit);
     }
   }
 
@@ -241,7 +303,7 @@ export class JavaAstCallExtractor {
     scope: ClassScope,
     vars: Map<string, string>,
     resolveType: TypeResolver,
-    returnTypeMap: Map<string, string>,
+    lookupReturnType: ReturnTypeLookup,
     emit: (source: string, target: string) => void
   ): void {
     const items = this.buildChainItems(primary);
@@ -265,17 +327,19 @@ export class JavaAstCallExtractor {
         if (scope.methodNames.has(it.name)) {
           emit(methodId, `${scope.classQN}.${it.name}`);
         }
-        // Receiver type of the next call must come from the invoked method's
-        // declared return type. When it is not in the model (cross-file), leave
-        // it unresolved and drop the tail call rather than guessing a type name.
-        currentType = returnTypeMap.get(`${scope.classQN}.${it.name}`) ?? null;
+        // Receiver type of the next call is the invoked method's declared return
+        // type. It is looked up in the project-wide index, so a method declared
+        // in another cartridge still resolves the tail call (Defect 4d). When it
+        // is genuinely unknown, leave it unresolved and drop the tail call rather
+        // than guessing a type name.
+        currentType = lookupReturnType(`${scope.classQN}.${it.name}`);
         continue;
       }
 
       if (currentType) {
         emit(methodId, `${currentType}.${it.name}`);
       }
-      currentType = this.nextTypeAfterCall(currentType, it, returnTypeMap, resolveType);
+      currentType = this.nextTypeAfterCall(currentType, it, lookupReturnType, resolveType);
     }
   }
 
@@ -338,7 +402,7 @@ export class JavaAstCallExtractor {
   private nextTypeAfterCall(
     currentType: string | null,
     it: ChainItem,
-    returnTypeMap: Map<string, string>,
+    lookupReturnType: ReturnTypeLookup,
     resolveType: TypeResolver
   ): string | null {
     // `.class`-mediated factory idiom: get(Foo.class) -> Foo.
@@ -350,14 +414,14 @@ export class JavaAstCallExtractor {
     }
     if (currentType) {
       // The receiver type of the next call in the chain is the declared return
-      // type of the invoked method, looked up in the current file's type model.
-      const declared = returnTypeMap.get(`${currentType}.${it.name}`);
+      // type of the invoked method. It is looked up in the project-wide index,
+      // so methods declared in another cartridge (or as a bodyless interface
+      // signature) still resolve the tail call (Defect 4d).
+      const declared = lookupReturnType(`${currentType}.${it.name}`);
       if (declared) return declared;
-      // Cross-file: the invoked method is declared in another file whose
-      // signature is unavailable here. Do NOT synthesize a type from the
-      // method/getter name (that would place an invented type in the current
-      // package). Leave it unresolved so the tail call is dropped rather than
-      // emitted with a wrong receiver type.
+      // Genuinely unknown (e.g. an unscanned compiled dependency): do NOT
+      // synthesize a type from the method/getter name. Leave it unresolved so
+      // the tail call is dropped rather than emitted with a wrong receiver type.
       return null;
     }
     return null;
@@ -462,7 +526,7 @@ export class JavaAstCallExtractor {
   }
 
   private methodName(method: CstNode): string | null {
-    if (method?.name !== 'methodDeclaration') return null;
+    if (method?.name !== 'methodDeclaration' && method?.name !== 'interfaceMethodDeclaration') return null;
     const declarator = this.findFirst(method, 'methodDeclarator');
     return declarator ? this.firstIdentifier(declarator) : null;
   }
@@ -486,6 +550,7 @@ export class JavaAstCallExtractor {
   private directMethods(classNode: CstNode): CstNode[] {
     return [
       ...this.findDirectDescendants(classNode, 'methodDeclaration'),
+      ...this.findDirectDescendants(classNode, 'interfaceMethodDeclaration'),
       ...this.findDirectDescendants(classNode, 'constructorDeclaration')
     ];
   }

@@ -20,9 +20,32 @@ export class JavaMethodParser {
     entities: ParsedEntity[], 
     relationships: ParsedRelationship[],
     addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
-    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
+    globalReturnTypes?: Map<string, string>
   ): Promise<void> {
-    return this.parseMethodsAsync(content, filePath, packageName, entities, relationships, addEntity, addRelationship);
+    return this.parseMethodsAsync(content, filePath, packageName, entities, relationships, addEntity, addRelationship, globalReturnTypes);
+  }
+
+  /**
+   * Signature-only pre-pass: records every declared method's fully-qualified
+   * return type into the shared project-wide index without emitting any edges.
+   * Running this over all Java files before CALLS extraction lets chained
+   * cross-cartridge calls (`a().b()`) resolve `b()`'s receiver type regardless of
+   * the order in which files are processed (Defect 4d).
+   */
+  async collectSignatures(
+    content: string,
+    filePath: string,
+    packageName: string,
+    globalReturnTypes: Map<string, string>
+  ): Promise<void> {
+    const extractionResult = this.contentExtractor.extractContent(content, filePath);
+    await this.astCallExtractor.collectReturnTypes(
+      content,
+      packageName,
+      (name: string) => this.resolveClassName(name, packageName, extractionResult.imports),
+      globalReturnTypes
+    );
   }
 
   private async parseMethodsAsync(
@@ -32,7 +55,8 @@ export class JavaMethodParser {
     entities: ParsedEntity[], 
     relationships: ParsedRelationship[],
     addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
-    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
+    globalReturnTypes?: Map<string, string>
   ): Promise<void> {
     const extractionResult = this.contentExtractor.extractContent(content, filePath);
     
@@ -43,7 +67,8 @@ export class JavaMethodParser {
       filePath,
       packageName,
       (name: string) => this.resolveClassName(name, packageName, extractionResult.imports),
-      addRelationship
+      addRelationship,
+      globalReturnTypes
     );
     
     for (const parsedMethod of extractionResult.functions) {
