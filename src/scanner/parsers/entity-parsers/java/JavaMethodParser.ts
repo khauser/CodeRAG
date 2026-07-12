@@ -5,11 +5,13 @@ import { RelationshipBuilder } from '../../base/RelationshipBuilder.js';
 import { JavaContentExtractor } from '../../extractors/java/JavaContentExtractor.js';
 import { JavaDocExtractor } from '../../extractors/java/JavaDocExtractor.js';
 import { JavaAnnotationExtractor } from '../../extractors/java/JavaAnnotationExtractor.js';
+import { JavaAstCallExtractor } from './JavaAstCallExtractor.js';
 
 export class JavaMethodParser {
   private contentExtractor = new JavaContentExtractor();
   private docExtractor = new JavaDocExtractor();
   private annotationExtractor = new JavaAnnotationExtractor();
+  private astCallExtractor = new JavaAstCallExtractor();
 
   parseMethods(
     content: string, 
@@ -19,8 +21,30 @@ export class JavaMethodParser {
     relationships: ParsedRelationship[],
     addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
     addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
-  ): void {
+  ): Promise<void> {
+    return this.parseMethodsAsync(content, filePath, packageName, entities, relationships, addEntity, addRelationship);
+  }
+
+  private async parseMethodsAsync(
+    content: string, 
+    filePath: string, 
+    packageName: string,
+    entities: ParsedEntity[], 
+    relationships: ParsedRelationship[],
+    addEntity: (entity: Omit<ParsedEntity, 'project_id'>) => void,
+    addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void
+  ): Promise<void> {
     const extractionResult = this.contentExtractor.extractContent(content, filePath);
+    
+    // Prefer AST-based CALLS extraction (handles method chaining, static calls,
+    // and .class-mediated factory idioms). Falls back to regex when parsing fails.
+    const astCallsEmitted = await this.astCallExtractor.extractFileCalls(
+      content,
+      filePath,
+      packageName,
+      (name: string) => this.resolveClassName(name, packageName, extractionResult.imports),
+      addRelationship
+    );
     
     for (const parsedMethod of extractionResult.functions) {
       // Determine the containing class
@@ -73,8 +97,10 @@ export class JavaMethodParser {
       }
 
       // Parse method calls and create call relationships
-      // Pass the containing class qualified name for proper internal method resolution
-      this.parseMethodCalls(content, parsedMethod, methodId, containingClass.qualified_name, extractionResult.imports, addRelationship, filePath, entities);
+      // Pass the containing class qualified name for proper internal method resolution.
+      // When the AST extractor already emitted CALLS edges, only regex-based
+      // REFERENCES are still needed here.
+      this.parseMethodCalls(content, parsedMethod, methodId, containingClass.qualified_name, extractionResult.imports, addRelationship, filePath, entities, astCallsEmitted);
     }
   }
 
@@ -108,14 +134,29 @@ export class JavaMethodParser {
     imports: any[],
     addRelationship: (rel: Omit<ParsedRelationship, 'project_id'>) => void,
     filePath: string,
-    entities: ParsedEntity[]
+    entities: ParsedEntity[],
+    astCallsEmitted: boolean = false
   ): void {
     if (!method.startLine || !method.endLine) return;
     
     let methodBody = this.extractMethodBody(content, method.startLine, method.endLine);
     
+    // Defect 1: strip comments and string/char literals so their contents are
+    // never mis-tokenized as type names or method calls.
+    methodBody = this.stripCommentsAndLiterals(methodBody);
+    
     // Remove annotations from the method body to avoid matching them as method calls
     methodBody = methodBody.replace(/@[A-Za-z_][A-Za-z0-9_]*(\s*\([^)]*\))?/g, '');
+    
+    // Defect 3: drop the method signature (everything up to and including the
+    // opening brace) so the declaration itself (e.g. `execute(...)`) is not
+    // counted as a self-call.
+    const braceIndex = methodBody.indexOf('{');
+    if (braceIndex !== -1) {
+      methodBody = methodBody.slice(braceIndex + 1);
+    }
+    
+    const containingPackage = containingClassName.substring(0, containingClassName.lastIndexOf('.'));
     
     // Collect method names in the containing class for internal call resolution
     const classMethodNames = new Set<string>();
@@ -125,49 +166,80 @@ export class JavaMethodParser {
       }
     }
     
-    // 1. Find internal method calls (method calls without a receiver)
-    const simpleMethodCallPattern = /(?<![.\w])([a-z][A-Za-z0-9_]*)\s*\(/g;
-    let match;
-    
-    while ((match = simpleMethodCallPattern.exec(methodBody)) !== null) {
-      const calledMethodName = match[1];
-      
-      if (this.isBuiltInMethod(calledMethodName)) continue;
-      if (this.isCommonAnnotation(calledMethodName)) continue;
-      
-      // Only resolve internal method calls
-      if (classMethodNames.has(calledMethodName)) {
-        const calledMethodId = `${containingClassName}.${calledMethodName}`;
-        addRelationship(RelationshipBuilder.createCalls(methodId, calledMethodId, filePath));
-      }
-    }
-    
-    // 2. Find cross-class instance method calls (field.method() or variable.method())
-    // Build a map of field/variable names to their resolved types
+    // Build a map of field/variable/parameter names to their resolved types.
     const fieldTypeMap = this.buildFieldTypeMap(content, containingClassName, imports);
     
-    const instanceCallPattern = /(\w+)\.([a-z][A-Za-z0-9_]*)\s*\(/g;
-    while ((match = instanceCallPattern.exec(methodBody)) !== null) {
-      const receiver = match[1];
-      const calledMethod = match[2];
+    // De-duplicate emitted CALLS edges.
+    const emittedCalls = new Set<string>();
+    const addCall = (targetId: string): void => {
+      if (targetId && !emittedCalls.has(targetId)) {
+        emittedCalls.add(targetId);
+        addRelationship(RelationshipBuilder.createCalls(methodId, targetId, filePath));
+      }
+    };
+    
+    let match: RegExpExecArray | null;
+    
+    // CALLS extraction (blocks 1-3) only runs as a fallback when the AST-based
+    // extractor could not process the file. REFERENCES (block 4) always runs.
+    if (!astCallsEmitted) {
+      // 1. Internal (receiver-less) method calls: foo(...)
+      const simpleMethodCallPattern = /(?<![.\w$])([a-z][A-Za-z0-9_]*)\s*\(/g;
+      while ((match = simpleMethodCallPattern.exec(methodBody)) !== null) {
+        const calledMethodName = match[1];
+        
+        if (this.isBuiltInMethod(calledMethodName)) continue;
+        if (this.isCommonAnnotation(calledMethodName)) continue;
+        
+        // Only resolve internal method calls
+        if (classMethodNames.has(calledMethodName)) {
+          addCall(`${containingClassName}.${calledMethodName}`);
+        }
+      }
       
-      if (this.isBuiltInMethod(calledMethod)) continue;
-      if (receiver === 'this' || receiver === 'super') continue;
+      // 2. Instance method calls on a typed receiver: receiver.method(...)
+      // A leading boundary (?<![.\w$]) prevents matching camelCase fragments
+      // (Defect 1) and ensures the receiver is a whole identifier.
+      const instanceCallPattern = /(?<![.\w$])([a-z][A-Za-z0-9_]*)\.([a-z][A-Za-z0-9_]*)\s*\(/g;
+      while ((match = instanceCallPattern.exec(methodBody)) !== null) {
+        const receiver = match[1];
+        const calledMethod = match[2];
+        
+        if (receiver === 'this' || receiver === 'super') continue;
+        if (this.isBuiltInMethod(calledMethod)) continue;
+        
+        // Resolve the receiver type from declarations. Emit real invocations,
+        // including java.* targets (Defect 2 wants java.lang.String.isEmpty).
+        const resolvedType = fieldTypeMap.get(receiver);
+        if (resolvedType) {
+          addCall(`${resolvedType}.${calledMethod}`);
+        }
+      }
       
-      // Try to resolve the receiver type from field declarations
-      const resolvedType = fieldTypeMap.get(receiver);
-      if (resolvedType && !this.isStandardLibraryType(resolvedType)) {
-        const calledMethodId = `${resolvedType}.${calledMethod}`;
-        addRelationship(RelationshipBuilder.createCalls(methodId, calledMethodId, filePath));
+      // 3. Static method calls via a type name: TypeName.method(...) (Defect 4)
+      const staticCallPattern = /(?<![.\w$])([A-Z][A-Za-z0-9_]*)\.([a-z][A-Za-z0-9_]*)\s*\(/g;
+      while ((match = staticCallPattern.exec(methodBody)) !== null) {
+        const typeName = match[1];
+        const calledMethod = match[2];
+        
+        if (this.isCommonAnnotation(typeName)) continue;
+        if (this.isBuiltInMethod(calledMethod)) continue;
+        
+        const resolvedType = this.resolveClassName(typeName, containingPackage, imports);
+        if (resolvedType) {
+          addCall(`${resolvedType}.${calledMethod}`);
+        }
       }
     }
 
-    // 3. Find class usages: new ClassName(...), ClassName.staticMethod(), (ClassName) cast
-    // This helps establish coupling between classes
+    // 4. Find class usages -> REFERENCES edges.
+    // The (?<![A-Za-z0-9_$]) boundary prevents matching capitalised fragments
+    // inside camelCase identifiers (Defect 1: ClassID / To).
     const classUsagePatterns = [
-      /new\s+([A-Z][A-Za-z0-9_]*)\s*[<(]/g,           // new ClassName( or new ClassName<
-      /([A-Z][A-Za-z0-9_]*)\.(?![A-Z])[a-z][A-Za-z0-9_]*\s*\(/g,  // ClassName.method(
-      /\(\s*([A-Z][A-Za-z0-9_]*)\s*\)/g,              // (ClassName) cast
+      /new\s+([A-Z][A-Za-z0-9_]*)\s*[<(]/g,                                        // new ClassName( or new ClassName<
+      /(?<![A-Za-z0-9_$])([A-Z][A-Za-z0-9_]*)\.(?![A-Z])[a-z][A-Za-z0-9_]*\s*\(/g,  // ClassName.method(
+      /(?<![A-Za-z0-9_$])([A-Z][A-Za-z0-9_]*)\.class\b/g,                           // ClassName.class
+      /\(\s*([A-Z][A-Za-z0-9_]*)\s*\)/g,                                           // (ClassName) cast
     ];
     
     const referencedClasses = new Set<string>();
@@ -187,7 +259,6 @@ export class JavaMethodParser {
     }
     
     // Resolve and create relationships for referenced classes
-    const containingPackage = containingClassName.substring(0, containingClassName.lastIndexOf('.'));
     for (const className of referencedClasses) {
       const resolvedClass = this.resolveClassName(className, containingPackage, imports);
       if (resolvedClass && !this.isStandardLibraryType(resolvedClass)) {
@@ -198,20 +269,52 @@ export class JavaMethodParser {
   }
 
   private resolveClassName(className: string, packageName: string, imports: any[]): string | null {
-    // Check imports for the type
+    // Strip generics and whitespace: List<Foo> -> List
+    const base = className.split('<')[0].trim();
+    if (!base) return null;
+    
+    // Already fully qualified
+    if (base.includes('.')) return base;
+    
+    // 1. Explicit single-type imports
     for (const imp of imports) {
-      if (imp.items?.includes(className) || imp.module.endsWith(`.${className}`)) {
-        return imp.module;
-      }
-      // Wildcard import
-      if (imp.items?.includes('*')) {
-        // We can't resolve wildcard imports reliably
-        continue;
+      if (imp.items?.includes('*')) continue; // wildcards handled below
+      if (imp.items?.includes(base) || imp.module.endsWith(`.${base}`)) {
+        return imp.module.endsWith(`.${base}`) ? imp.module : `${imp.module}.${base}`;
       }
     }
     
-    // Default to same package
-    return `${packageName}.${className}`;
+    // 2. Implicit java.lang.* resolution (Defect 2: String -> java.lang.String)
+    if (this.isJavaLangType(base)) {
+      return `java.lang.${base}`;
+    }
+    
+    // 3. On-demand (wildcard) imports - only safe when unambiguous
+    const wildcards = imports.filter(imp => imp.items?.includes('*'));
+    if (wildcards.length === 1) {
+      return `${wildcards[0].module}.${base}`;
+    }
+    
+    // 4. Same-package fallback - only for things that look like a type name
+    if (/^[A-Z]/.test(base)) {
+      return `${packageName}.${base}`;
+    }
+    
+    // 5. Unresolved - do NOT invent a current-package target (Defects 2 & 3)
+    return null;
+  }
+
+  private isJavaLangType(name: string): boolean {
+    const javaLang = new Set([
+      'String', 'Object', 'Class', 'Integer', 'Long', 'Double', 'Float',
+      'Boolean', 'Byte', 'Short', 'Character', 'Number', 'Void',
+      'Math', 'System', 'Thread', 'Runnable', 'CharSequence', 'Iterable',
+      'Comparable', 'Cloneable', 'StringBuilder', 'StringBuffer',
+      'Exception', 'RuntimeException', 'Error', 'Throwable',
+      'IllegalArgumentException', 'IllegalStateException', 'NullPointerException',
+      'IndexOutOfBoundsException', 'ClassCastException', 'UnsupportedOperationException'
+    ]);
+    return javaLang.has(name);
   }
 
   private isStandardJavaClass(className: string): boolean {
@@ -309,6 +412,22 @@ export class JavaMethodParser {
   private extractMethodBody(content: string, startLine: number, endLine: number): string {
     const lines = content.split('\n');
     return lines.slice(startLine - 1, endLine).join('\n');
+  }
+
+  /**
+   * Removes comments and string/char literals from a code fragment so that their
+   * contents are never mis-tokenized as type names or method calls (Defect 1).
+   */
+  private stripCommentsAndLiterals(code: string): string {
+    return code
+      // Block comments
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      // Line comments
+      .replace(/\/\/[^\n]*/g, ' ')
+      // String literals
+      .replace(/"([^"\\]|\\.)*"/g, '""')
+      // Char literals
+      .replace(/'([^'\\]|\\.)*'/g, "''");
   }
 
   private isBuiltInMethod(methodName: string): boolean {

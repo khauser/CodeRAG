@@ -82,7 +82,7 @@ export class JavaParser extends BaseLanguageParser {
       this.parseInterfaces(content, filePath, packageName, entities, relationships);
       this.parseEnums(content, filePath, packageName, entities, relationships);
 
-      this.methodParser.parseMethods(
+      await this.methodParser.parseMethods(
         content, filePath, packageName, entities, relationships,
         (entity) => this.addEntity(entities, entity),
         (rel) => this.addRelationship(relationships, rel)

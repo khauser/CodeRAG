@@ -250,5 +250,82 @@ public class TestClass {
       expect(annotatedWithRelationships.filter(r => r.source.includes('.service')).length).toBe(1);
       expect(annotatedWithRelationships.filter(r => r.source.includes('.other')).length).toBe(1);
     });
+
+    describe('call & reference extraction (GetProductTaxRate regression)', () => {
+      // Synthetic version of
+      // com.intershop.component.b2b.pipelet.taxation.GetProductTaxRate.execute
+      // exercising Defects 1-4 from coderag-parser-fix.md.
+      const source = `package com.intershop.component.b2b.pipelet.taxation;
+
+import com.intershop.beehive.core.capi.naming.NamingMgr;
+import com.intershop.component.foundation.capi.tax.TaxMgr;
+import com.intershop.component.product.capi.ProductBO;
+
+public class GetProductTaxRate extends Pipelet {
+  public int execute(PipelineDictionary dict) throws PipeletExecutionException {
+    ProductBO product = dict.getRequired("ProductBO");
+    String taxClassID = product.getTaxClassID();
+    if (null == taxClassID || taxClassID.isEmpty()) {
+      return PIPELET_ERROR;
+    }
+    // retrieve persistent ship-to address instance
+    TaxMgr taxMgr = NamingMgr.get(TaxMgr.class);
+    dict.put("TaxRate", taxMgr);
+    return PIPELET_NEXT;
+  }
+}`;
+      const executeId = 'com.intershop.component.b2b.pipelet.taxation.GetProductTaxRate.execute';
+
+      const getEdges = async () => {
+        const result = await parser.parseFile('/test/GetProductTaxRate.java', source, projectId);
+        const calls = result.relationships.filter(r => r.type === 'calls' && r.source === executeId);
+        const refs = result.relationships.filter(r => r.type === 'references' && r.source === executeId);
+        return { calls, refs };
+      };
+
+      test('Defect 1: no reference to camelCase fragments (ClassID / To)', async () => {
+        const { refs } = await getEdges();
+        expect(refs.some(r => r.target.endsWith('.ClassID'))).toBe(false);
+        expect(refs.some(r => r.target.endsWith('.To'))).toBe(false);
+      });
+
+      test('Defect 2: String.isEmpty resolves to java.lang.String.isEmpty', async () => {
+        const { calls } = await getEdges();
+        expect(calls.some(r => r.target === 'java.lang.String.isEmpty')).toBe(true);
+        // Must NOT be attributed to the enclosing package
+        expect(calls.some(r =>
+          r.target === 'com.intershop.component.b2b.pipelet.taxation.String.isEmpty'
+        )).toBe(false);
+      });
+
+      test('Defect 3: no self-call execute -> execute', async () => {
+        const { calls } = await getEdges();
+        expect(calls.some(r => r.target === executeId)).toBe(false);
+      });
+
+      test('Defect 4: static call NamingMgr.get is captured', async () => {
+        const { calls } = await getEdges();
+        expect(calls.some(r =>
+          r.target === 'com.intershop.beehive.core.capi.naming.NamingMgr.get'
+        )).toBe(true);
+      });
+
+      test('previously-correct edges remain: instance calls resolved', async () => {
+        const { calls } = await getEdges();
+        expect(calls.some(r =>
+          r.target === 'com.intershop.component.product.capi.ProductBO.getTaxClassID'
+        )).toBe(true);
+        // dict is a PipelineDictionary parameter (same-package fallback)
+        expect(calls.some(r => r.target.endsWith('.PipelineDictionary.getRequired'))).toBe(true);
+        expect(calls.some(r => r.target.endsWith('.PipelineDictionary.put'))).toBe(true);
+      });
+
+      test('.class literal produces a TaxMgr reference', async () => {
+        const { refs } = await getEdges();
+        expect(refs.some(r =>
+          r.target === 'com.intershop.component.foundation.capi.tax.TaxMgr'
+        )).toBe(true);
+      });
+    });
   });
 });
