@@ -8,6 +8,66 @@ export interface FindNodesByAnnotationParams {
   node_type?: 'class' | 'interface' | 'enum' | 'exception' | 'function' | 'method' | 'field' | 'package' | 'module';
 }
 
+/**
+ * Structure-only projection of a CodeNode's stored properties. Explicitly enumerates
+ * the fields that may leave the server so that internal ML artifacts
+ * (`semantic_embedding`, `embedding_*`) can NEVER leak — regardless of whether the
+ * optional `node_type` filter is set. This was the source of a confirmed embedding
+ * leak (~2.2 MB responses) in the previously unfiltered `...nodeProps` spread.
+ */
+function projectNodeProps(props: any): Record<string, any> {
+  if (!props || typeof props !== 'object') return {};
+  const toNumber = (v: any) =>
+    v && typeof v.toNumber === 'function' ? v.toNumber() : v;
+  return {
+    id: props.id,
+    project_id: props.project_id,
+    type: props.type,
+    name: props.name,
+    qualified_name: props.qualified_name,
+    description: props.description,
+    source_file: props.source_file,
+    start_line: toNumber(props.start_line),
+    end_line: toNumber(props.end_line),
+    modifiers: props.modifiers || [],
+    is_abstract: props.is_abstract ?? false,
+    attributes_json: props.attributes_json
+  };
+}
+
+/**
+ * Cypher map projection for a CodeNode variable. By returning an explicit map instead
+ * of the whole node, Neo4j never loads or transfers the large `semantic_embedding`
+ * column (3072 floats/node) — reducing DB→server transfer, not just the MCP payload.
+ */
+function nodeProjectionCypher(alias: string): string {
+  return `{
+    id: ${alias}.id,
+    project_id: ${alias}.project_id,
+    type: ${alias}.type,
+    name: ${alias}.name,
+    qualified_name: ${alias}.qualified_name,
+    description: ${alias}.description,
+    source_file: ${alias}.source_file,
+    start_line: ${alias}.start_line,
+    end_line: ${alias}.end_line,
+    modifiers: ${alias}.modifiers,
+    is_abstract: ${alias}.is_abstract,
+    attributes_json: ${alias}.attributes_json
+  }`;
+}
+
+/** Cypher map projection for a matched annotation node (structure only). */
+function annotationProjectionCypher(alias: string): string {
+  return `{
+    id: ${alias}.id,
+    name: ${alias}.name,
+    type: ${alias}.type,
+    qualified_name: ${alias}.qualified_name,
+    attributes_json: ${alias}.attributes_json
+  }`;
+}
+
 export async function findNodesByAnnotation(
   neo4jClient: Neo4jClient,
   params: FindNodesByAnnotationParams
@@ -48,7 +108,7 @@ export async function findNodesByAnnotation(
   }
 
   query += `
-    RETURN n, a as matched_annotation
+    RETURN ${nodeProjectionCypher('n')} AS n, ${annotationProjectionCypher('a')} AS matched_annotation
     ORDER BY n.qualified_name
     LIMIT 200
   `;
@@ -74,7 +134,7 @@ export async function findNodesByAnnotation(
     }
 
     fallbackQuery += `
-      RETURN n, null as matched_annotation
+      RETURN ${nodeProjectionCypher('n')} AS n, null as matched_annotation
       ORDER BY n.qualified_name
       LIMIT 200
     `;
@@ -84,11 +144,18 @@ export async function findNodesByAnnotation(
 
   return {
     nodes: result.records?.map(record => {
-      const nodeProps = record.get('n').properties;
+      // Accept both an explicit Cypher map (real query) and a Neo4j Node with
+      // `.properties` (used by unit-test mocks). Either way, only structural fields
+      // are exposed — embeddings are already excluded by the Cypher projection.
+      const rawNode = record.get('n');
+      const nodeProps = projectNodeProps(rawNode?.properties ?? rawNode);
       const annotation = record.get('matched_annotation');
+      const annotationProps = annotation?.properties
+        ? projectNodeProps(annotation.properties)
+        : annotation ?? null;
       return {
         ...nodeProps,
-        matched_annotation: annotation?.properties ?? annotation ?? null
+        matched_annotation: annotationProps
       };
     }) || [],
     total_count: result.records?.length || 0

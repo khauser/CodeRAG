@@ -409,4 +409,59 @@ describe('Find Nodes By Annotation Tool', () => {
       expect(result.nodes[0].matched_annotation.parameters.produces).toBe('application/json');
     });
   });
+
+  // Regression tests for the confirmed embedding leak (§4 of the hardening spec):
+  // embeddings must never be returned, regardless of whether `node_type` is set.
+  describe('embedding leak (§4)', () => {
+    const leakyProperties = {
+      id: 'n1',
+      project_id: 'proj',
+      type: 'class',
+      name: 'FooResource',
+      qualified_name: 'com.example.FooResource',
+      modifiers: ['public'],
+      is_abstract: false,
+      attributes_json: '{}',
+      // These must NEVER be returned:
+      semantic_embedding: new Array(3072).fill(0.0123),
+      embedding_model: 'text-embedding-3-large',
+      embedding_version: '1.0',
+      embedding_created_at: '2026-01-01T00:00:00Z'
+    };
+
+    const makeLeakyResult = () => ({
+      records: [
+        {
+          get: jest.fn((field: string) => {
+            if (field === 'n') return { properties: { ...leakyProperties } };
+            if (field === 'matched_annotation') return { properties: { name: '@Path', type: 'annotation' } };
+            return null;
+          })
+        }
+      ]
+    });
+
+    test('does not leak embeddings WITHOUT node_type', async () => {
+      mockNeo4jClient.runQuery.mockResolvedValue(makeLeakyResult());
+      const result = await findNodesByAnnotation(mockNeo4jClient, { annotation_name: 'Path' });
+      const json = JSON.stringify(result);
+      expect(json).not.toContain('semantic_embedding');
+      expect(json).not.toContain('embedding_model');
+      expect(json).not.toContain('embedding_version');
+      expect(json).not.toContain('embedding_created_at');
+      expect(result.nodes[0].id).toBe('n1');
+      expect(result.nodes[0].name).toBe('FooResource');
+    });
+
+    test('does not leak embeddings WITH node_type', async () => {
+      mockNeo4jClient.runQuery.mockResolvedValue(makeLeakyResult());
+      const result = await findNodesByAnnotation(mockNeo4jClient, {
+        annotation_name: 'Path',
+        node_type: 'class'
+      });
+      const json = JSON.stringify(result);
+      expect(json).not.toContain('semantic_embedding');
+      expect(json).not.toContain('embedding_model');
+    });
+  });
 });
